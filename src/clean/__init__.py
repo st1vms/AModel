@@ -1,0 +1,1 @@
+"""Normalization and merge logic."""
