@@ -1,17 +1,52 @@
 # AModel — Project Memory
 
-Persistent notes for the Serie A match-data pipeline (2016-17 → 2026-27).
-Keep this file updated as the project evolves (see AGENTS.md).
+Persistent notes for the multi-league soccer match-data + ML pipeline
+(2016-17 → 2026-27). Keep this file updated as the project evolves (see AGENTS.md).
 
 ## What this is
 
-Python pipeline that extracts Serie A match data from two hybrid sources,
-normalizes it, and loads it into SQLite (`data/amodel.db`) with CSV exports
-and validation. Plan: `implementation_plan.md`.
+Python pipeline that extracts soccer match data for **any registered league**
+from two hybrid sources, normalizes it, loads it into SQLite
+(`data/amodel.db`), and trains/evaluates 1X2 + goal models per league.
+Plans: `implementation_plan_data_scraper.md`, `implementation_plan_ml_models.md`,
+`implementation_plan_multi_league.md`.
 
 - **Primary source**: football-data.co.uk CSVs — scores, HT, shots, referee.
 - **Secondary source**: Understat — xG (and cross-checks).
 - Seasons: 2016-17 … 2026-27 (11). `2026-27` is in progress (partial, 80 matches as of 2026-10-27).
+
+## Multi-league architecture (2026-10)
+
+- **`config.LEAGUES`** is the single source of truth: registry key →
+  `{name, fd_div, understat_slug, seasons, in_progress, expected_matches, pandemic_window}`.
+  Registered: `premier_league` (E0), `serie_a` (I1, default), `la_liga` (SP1),
+  `bundesliga` (D1, 306 matches/season — 18 teams), `ligue_1` (F1).
+  `DEFAULT_LEAGUE = "serie_a"`.
+- **Per-league data layout** (legacy flat files migrated 2026-10):
+  - raw: `data/raw/{football_data,understat}/{league}/...`
+  - ML: `data/export/ml/{league}/{matches_clean.csv, team_labels.csv, models/, results/}`
+  - CSV export: `data/export/{league}/{season}.csv` + `matches_full.csv` (all leagues, league column)
+- **Per-league models**: each league trains its own `pipeline.joblib` under
+  `data/export/ml/{league}/models/`. The UI sidebar has a **League selector**
+  (first control); every tab threads `opts["league"]` through.
+- **DB**: `teams` and `matches` carry a `league` column;
+  `UNIQUE(league, name)` / `UNIQUE(season, league, date, home_team_id, away_team_id)`.
+  Legacy single-league DBs auto-migrate on next `get_conn()`
+  (`upsert._migrate` backfills `league='serie_a'`).
+- **Path helpers** (use these, not the legacy constants):
+  `config.league_dir(source, league)`, `config.ml_dir(league)`,
+  `config.ml_results_dir(league)`, `config.ml_models_dir(league)`,
+  `config.max_matchdays(league)` (380→38, 306→34).
+- **League-aware signatures**: `merge(league)`, `upsert.load(league)`,
+  `fetch_all(league, force)`, `clean.load_matches(source, league)`,
+  `data.load_data(league)`, `data.derive_season(date, league)` (per-league
+  pandemic window), `train.run_training(league=...)`,
+  `predict.load_pipeline(league)`, `fixtures.build_fixtures(season, league)`,
+  `csv_export.export(league=None)`.
+- **Form/matchday features** are computed per `(league, season, team)` when a
+  `league` column is present (guarded by `has_league` in `clean.py`).
+- **Adding a league**: add an entry to `config.LEAGUES`, then fetch + upsert +
+  clean + train for it. No code changes needed.
 
 ## Environment
 
@@ -43,28 +78,28 @@ and validation. Plan: `implementation_plan.md`.
 ## Pipeline architecture
 
 ```
-config.py                 # seasons, paths, URLs, fetch settings (single source of truth)
+config.py                 # LEAGUES registry, paths, URLs, fetch settings (single source of truth)
 src/fetch/http.py         # get_text() with retry/backoff, polite_sleep()
-src/fetch/football_data_csv.py  # fetch_season/fetch_all -> data/raw/football_data/{season}.csv
-src/fetch/understat.py    # fetch -> data/raw/understat/{year}.json
+src/fetch/football_data_csv.py  # fetch_season/fetch_all(league) -> data/raw/football_data/{league}/{season}.csv
+src/fetch/understat.py    # fetch(league) -> data/raw/understat/{league}/{year}.json
 src/clean/normalize.py    # canonical_team(), parse_date(), season_from_date(), to_int/float_or_none
-src/clean/merge.py        # load_football_data(), load_understat(), merge() -> unified DataFrame
-src/db/schema.sql         # DDL: teams, matches, seasons, players, player_match_stats
-src/db/upsert.py          # get_conn(), load() -> idempotent upsert + seasons summary
-src/export/csv_export.py  # export() -> data/export/matches_full.csv + per-season CSVs
-src/validate/checks.py    # run_checks() -> .tmp/validation_report.txt, exit 1 on hard errors
-src/preprocess/clean.py   # ML preprocessing: clean/encode/feature-engineer -> data/export/ml/matches_clean.csv
-src/ml/data.py            # load matches_clean.csv, derive season, targets/features
+src/clean/merge.py        # load_football_data(league), load_understat(league), merge(league)
+src/db/schema.sql         # DDL: teams(league), matches(league), seasons(league), players, player_match_stats
+src/db/upsert.py          # get_conn() (auto-migrates legacy DB), load(league) -> idempotent upsert
+src/export/csv_export.py  # export(league=None) -> data/export/matches_full.csv + data/export/{league}/...
+src/validate/checks.py    # run_checks(league) -> .tmp/validation_report.txt, exit 1 on hard errors
+src/preprocess/clean.py   # ML preprocessing: clean/encode/feature-engineer -> data/export/ml/{league}/matches_clean.csv
+src/ml/data.py            # load_data(league), derive_season(date, league), targets/features
 src/ml/splits.py          # time_split (cutoff 2023-24) + walk_forward_splits (2022-23..2025-26)
 src/ml/models.py          # baselines + XGB/LGBM/CatBoost classifiers & goal regressors
 src/ml/evaluate.py        # log loss, ROC-AUC, accuracy, MAE/RMSE, aggregation
 src/ml/plots.py           # confusion matrix, feature importance, calibration curve
-src/ml/train.py           # CLI: tune -> train -> evaluate -> save models/plots
-                          #   + run_training() (structured dict for the UI)
-src/ml/predict.py         # CLI: inference with saved pipeline.joblib
-src/ml/fixtures.py        # build_fixtures(): scheduled (unplayed) matches ->
+src/ml/train.py           # CLI: tune -> train -> evaluate -> save models/plots (per league)
+                          #   + run_training(league=...) (structured dict for the UI)
+src/ml/predict.py         # CLI: inference with saved pipeline.joblib (per league)
+src/ml/fixtures.py        # build_fixtures(season, league): scheduled (unplayed) matches ->
                           #   prediction-ready frame (auto from raw Understat JSON)
-src/ui/app.py             # Streamlit UI: update data / train / predict (3 tabs)
+src/ui/app.py             # Streamlit UI: League selector + update data / train / predict (3 tabs)
 tests/test_pipeline.py    # 10 pytest tests
 tests/test_preprocess.py  # 12 pytest tests
 tests/test_ml.py          # ML tests (season derivation, splits, metrics, smoke)
@@ -89,26 +124,28 @@ tests/test_ui.py          # UI tests (fixtures, run_training, app import)
 
 ## How to run
 
+All CLIs accept `--league KEY` (default: `serie_a`).
+
 ```
-.venv/bin/python -m src.fetch.football_data_csv [--force]   # fetch CSVs
-.venv/bin/python -m src.fetch.understat                     # fetch xG JSON
-.venv/bin/python -m src.clean.merge                         # merge (prints per-season counts)
-.venv/bin/python -m src.db.upsert                           # load into SQLite
-.venv/bin/python -m src.export.csv_export                   # CSV exports
-.venv/bin/python -m src.validate.checks                     # validation report
-.venv/bin/python -m src.preprocess.clean [--encoding label|onehot|target]
+.venv/bin/python -m src.fetch.football_data_csv --league KEY [--force]   # fetch CSVs
+.venv/bin/python -m src.fetch.understat --league KEY                     # fetch xG JSON
+.venv/bin/python -m src.clean.merge --league KEY                         # merge (prints per-season counts)
+.venv/bin/python -m src.db.upsert --league KEY                           # load into SQLite
+.venv/bin/python -m src.export.csv_export [--league KEY]                 # CSV exports
+.venv/bin/python -m src.validate.checks --league KEY                     # validation report
+.venv/bin/python -m src.preprocess.clean --league KEY [--encoding label|onehot|target]
         [--keep-flagged] [--keep-metadata] [--form-window 5] [--out PATH]
-.venv/bin/python -m src.ml.train [--include-ht] [--no-xg] [--walk-forward]
+.venv/bin/python -m src.ml.train --league KEY [--include-ht] [--no-xg] [--walk-forward]
         [--skip-tuning] [--out-dir PATH]
-.venv/bin/python -m src.ml.predict --demo | --matches fixtures.csv
-.venv/bin/python -m streamlit run src/ui/app.py             # Streamlit UI
+.venv/bin/python -m src.ml.predict --league KEY --demo | --matches fixtures.csv
+.venv/bin/python -m streamlit run src/ui/app.py             # Streamlit UI (League selector in sidebar)
 .venv/bin/python -m pytest tests/ -q                        # tests
 ```
 
 ## Preprocessing (ML-ready frame)
 
 `src/preprocess/clean.py` turns the merged frame (DB or export CSV) into a
-modeling-ready CSV at `data/export/ml/matches_clean.csv`.
+modeling-ready CSV at `data/export/ml/{league}/matches_clean.csv`.
 
 - **Cleaning**: `date` → datetime; drops `score_mismatch` rows (Sassuolo-Pescara
   2016-08-28) and HT-null rows (same row); drops `referee` (null in **all** 3880
@@ -150,9 +187,10 @@ goal regressors on `matches_clean.csv` (3,879 rows, 34 teams, 11 seasons).
   `--skip-tuning` uses defaults.
 - **Calibration**: isotonic on the 2023-24 tuning slice, applied to the best
   GBM before final evaluation.
-- **Outputs**: `data/export/ml/results/*.csv` (single_split, walk_forward,
-  tuning), `confusion_matrix.png`, `feature_importance.png`,
-  `calibration_curve.png`, `data/export/ml/models/pipeline.joblib`.
+- **Outputs** (per league): `data/export/ml/{league}/results/*.csv`
+  (single_split, walk_forward, tuning), `confusion_matrix.png`,
+  `feature_importance.png`, `calibration_curve.png`,
+  `data/export/ml/{league}/models/pipeline.joblib` (carries a `league` key).
 - **Season derivation** (`data.derive_season`): month >= 7 -> season starting
   that year; month <= 6 -> season ending that year; pandemic window
   (2020-06-01..2020-08-31) -> 2019-20.
@@ -194,24 +232,30 @@ Goal regression (walk-forward MAE): best ~0.70 (away, lightgbm) / ~0.76
 Streamlit app (only new dep: `streamlit>=1.30`) to update data, train, and
 predict without the CLI. Run: `.venv/bin/python -m streamlit run src/ui/app.py`.
 
-- **Tab 1 — Update data**: `football_data_csv.fetch_all(force)` →
-  `understat.fetch_all(force)` → `upsert.load()` → rebuild
-  `matches_clean.csv` + `team_labels.csv` (mirrors `preprocess.clean.main`).
-  Shows DB/clean-CSV metrics (cached via `st.cache_data`, cleared after update).
-- **Tab 2 — Train**: calls `train.run_training(...)` (new function extracted
-  from the old `main()`; same flow, returns a dict with result frames,
-  `best_name`, `saved` paths, `elapsed`, etc. and takes a `log` callable).
-  Renders result tables + the 3 PNGs; falls back to last saved results CSVs.
-- **Tab 3 — Predict**: `fixtures.build_fixtures(season, n_matchdays,
+- **Sidebar**: **League selector first** (from `config.LEAGUE_ORDER`, stored in
+  `st.session_state["league"]`), then season (from the league's `seasons`),
+  matchdays (1–`config.max_matchdays(league)`), include_ht / no_xg /
+  walk_forward / skip_tuning. Page title shows the selected league name.
+- **Tab 1 — Update data**: `football_data_csv.fetch_all(league, force)` →
+  `understat.fetch_all(league, force)` → `upsert.load(league)` → rebuild
+  `data/export/ml/{league}/matches_clean.csv` + `team_labels.csv`
+  (mirrors `preprocess.clean.main`). Shows DB/clean-CSV metrics (cached via
+  `st.cache_data`, cleared after update).
+- **Tab 2 — Train**: calls `train.run_training(league=..., ...)` (new function
+  extracted from the old `main()`; same flow, returns a dict with result
+  frames, `best_name`, `saved` paths, `elapsed`, etc. and takes a `log`
+  callable). Renders result tables + the 3 PNGs; falls back to last saved
+  results CSVs.
+- **Tab 3 — Predict**: `fixtures.build_fixtures(season, league, n_matchdays,
   labels=pipeline["team_labels"])` → `predict.prepare_fixtures` →
-  `predict.predict`. Decodes codes→names for display, offers CSV download.
-  Sidebar: season, matchdays (1–38), include_ht / no_xg / walk_forward /
-  skip_tuning.
+  `predict.predict`. Decodes codes→names for display, offers CSV download
+  (`predictions_{league}_{season}.csv`).
 
 ### src/ml/fixtures.py — auto fixtures
-- `load_scheduled(season)`: reads `data/raw/understat/{start_year}.json`,
+- `load_scheduled(season, league)`: reads
+  `data/raw/understat/{league}/{start_year}.json`,
   keeps `isResult is False` rows (the merged DB drops them), filters by
-  `derive_season(date) == season`, returns `date, home_team, away_team`
+  `derive_season(date, league) == season`, returns `date, home_team, away_team`
   (canonical names), sorted by date.
 - `build_fixtures(season, n_matchdays=None, labels=None)`:
   - shots/xG filled with **league averages** from played matches (best prior).
@@ -231,16 +275,84 @@ pipeline therefore carried a name→code map. Fixed in **both** writers
 `(code, team)` rows; regenerated `team_labels.csv` and retrained so
 `pipeline.joblib` now carries `{code: name}`.
 
-## Current status (2026-10-27)
+### Bundesliga canonical-map bug (fixed 2026-10-27)
+`CANONICAL_BY_LEAGUE["bundesliga"]` was **empty**, so football-data short
+names (`Hertha`, `Ein Frankfurt`, `M'gladbach`, `Dortmund`, …) never aligned
+with Understat full names (`Hertha Berlin`, `Eintracht Frankfurt`,
+`Borussia M.Gladbach`, `Borussia Dortmund`, …) on the merge key
+`(season_file, home, away)`. Result: 234 matches/season became
+`understat_only` duplicates (DB had 540 rows for a 306-match season, 48 team
+rows instead of 31); the clean step dropped those duplicates (null HT),
+leaving only the football-data rows — **all without xG** (2,476/3,122 rows
+NaN). GBMs tolerate NaN natively, so tuning passed, but
+`LogisticRegression` raised `Input X contains NaN` during training.
+Fix: full 31-team Bundesliga map in `normalize.py` (canonical names = the
+Understat-style names already in the DB, so the upsert reuses team rows);
+cleared + re-upserted Bundesliga (3,123 matches, 31 teams, 0 xG nulls,
+0 understat_only) and rebuilt `matches_clean.csv`. Regression test:
+`tests/test_pipeline.py::test_canonical_team_bundesliga_aliases`.
+**Lesson**: when adding a league, populate its canonical map *before*
+fetching — an empty map silently produces `understat_only` duplicates and
+xG-less rows. Same bug fixed 2026-10-27 for the other three leagues
+(`premier_league` 6 name pairs, `la_liga` 13, `ligue_1` 4) with full
+canonical maps + regression tests (`test_canonical_team_{premier_league,la_liga,ligue_1}_aliases`)
+and a clear/re-upsert/rebuild: PL 3,880 matches / 35 teams, La Liga 3,899 / 32,
+Ligue 1 3,550 / 33 — all 0 xG nulls, 0 `understat_only` (Ligue 1 keeps 1
+legit `understat_only`: 2026-08-23 PSG-Rennes, sources disagree on home/away;
+plus 1 football-data row with genuinely missing HT, Bastia-Lyon 2017-04-16).
+All 5 leagues now have full canonical maps.
 
-- **3880 matches** in DB: 380 × 10 completed seasons + 80 (in-progress 2026-27).
-- **34 teams**, 11 seasons.
+### load_pipeline positional-arg bug (fixed 2026-10-28)
+The migration changed the signature to `load_pipeline(league=..., path=None)`
+(league first), but `app.py`'s `load_pipeline_cached` still called it with a
+bare positional path — so the path string bound to `league`, `path` stayed
+`None`, and `ml_models_dir(<abs path>)` collapsed via pathlib's absolute-join
+rule (`Path("/a") / "/abs"` → `/abs`), producing a doubled path and
+`NotADirectoryError`. Fixed: `app.py` now calls `load_pipeline(path=path)`
+(keyword), and `load_pipeline` raises a clear `ValueError` when `path is None`
+and `league` is not in `config.LEAGUES`. Regression test:
+`tests/test_ml.py::test_load_pipeline_keyword_path`.
+Note: the on-disk `pipeline.joblib` predates the migration and has **no
+`league` key** — nothing in `app.py`/`predict.py` reads it, so it's compatible.
+
+### Predict-tab NaN crash for HT pipelines (fixed 2026-10-28)
+PL/LL/L1 pipelines were saved with `include_ht=True` (verification runs used
+`--include-ht`), but pre-match fixtures have NaN HT goals by design →
+`ValueError: Input X contains NaN` in `LogisticRegression.predict_proba`
+(GBMs tolerate NaN, so only the logistic pipelines crashed). Fix:
+`src/ml/predict.py::predict` imputes `ht_*` columns with 0.0 ("no goals
+scored yet" — the modal HT state) before scoring; UI warning updated to
+explain the imputation. Regression test:
+`tests/test_ml.py::test_predict_imputes_nan_ht_features`. Note: retraining
+without **Include HT goals** still gives the cleanest pre-match predictions.
+
+### build_fixtures object-dtype form columns (fixed 2026-10-28)
+Ligue 1's 2026-08-23 PSG-Rennes match exists in the DB twice (football-data
+row + reversed `understat_only` row), so PSG/Rennes each appeared twice on
+the same date in `build_fixtures`' historical frame → duplicate
+`(season, date, team)` keys → `_form_features`' `home.loc` returned a Series
+→ object-dtype form columns → LightGBM `ValueError: pandas dtypes must be
+int, float or bool`. Fix: `build_fixtures` drops null-HT rows from
+`historical` (matching the clean pipeline, which is what the models were
+trained on). Regression test:
+`tests/test_ml.py::test_build_fixtures_form_columns_numeric`.
+
+## Current status (2026-10-28)
+
+- **Multi-league migration done**: legacy flat Serie A files moved to
+  `data/raw/{source}/serie_a/` and `data/export/ml/serie_a/`; DB auto-migrated
+  (all rows `league='serie_a'`). 5 leagues registered in `config.LEAGUES`.
+- **Serie A**: 3880 matches in DB (380 × 10 completed + 80 in-progress 2026-27),
+  34 teams, 11 seasons.
+- **All 5 leagues fully fetched** (11 seasons each): PL 3,880 matches / 35
+  teams, La Liga 3,899 / 32, Ligue 1 3,550 / 33, Bundesliga 3,123 / 31 —
+  all with 0 xG nulls after the canonical-map fixes (2026-10-27).
 - **Validation: 0 hard errors**, 4 legitimate warnings:
   - 2019-20: 114 matches with month outside Aug–May (pandemic — season ran to Aug 2020).
   - 2022-23: 10 matches in June (season ended 2023-06-04).
   - 2023-24: 1 match in June (ended 2024-06-02).
   - 2026-27: 52 cross-source xG mismatches > 0.15 (football-data vs Understat xG models differ).
-- **43/43 tests pass** (10 pipeline + 12 preprocessing + 11 ML + 10 UI).
+- **52/52 tests pass** (14 pipeline + 12 preprocessing + 14 ML + 12 UI).
 - Spot-checks verified: 2024-25 champion **Napoli** (82 pts), Bologna 5-0 Lazio 2025-03-16, Inter 4-4 Juventus 2024-10-27.
 - Champions: 2016-17/17-18/18-19/19-20 Juventus, 2020-21 Inter, 2021-22 AC Milan, 2022-23 Napoli, 2023-24 Inter, 2024-25 Napoli, 2025-26 Inter.
 
@@ -255,6 +367,10 @@ pipeline therefore carried a name→code map. Fixed in **both** writers
 
 ## Done
 
+- **Multi-league support** (2026-10-28) — `config.LEAGUES` registry (5 leagues),
+  per-league raw/ML/DB layout, per-league models, UI League selector,
+  legacy Serie A data migrated, league-aware `csv_export`. Plan:
+  `implementation_plan_multi_league.md`.
 - **Streamlit UI** (`src/ui/app.py`) — update data / train / predict, 3 tabs.
   Auto-fixture builder (`src/ml/fixtures.py`) recovers scheduled matches from
   the raw Understat JSON. `train.run_training()` extracted for the UI.

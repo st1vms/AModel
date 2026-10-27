@@ -1,15 +1,17 @@
-"""Fetch Understat Serie A league data and save the raw JSON.
+"""Fetch Understat league data and save the raw JSON.
 
 Understat loads its data via an AJAX endpoint (the league HTML page no longer
 embeds `var data = {...}`). The endpoint is:
 
-    https://understat.com/getLeagueData/Serie_A/{start_year}
+    https://understat.com/getLeagueData/{slug}/{start_year}
 
 which returns JSON with keys: teams, players, dates. `dates` is a list of
 match dicts: {id, isResult, h:{title}, a:{title}, goals:{h,a}, xG:{h,a},
 datetime:"YYYY-MM-DD HH:MM:SS", forecast}.
 
-Usage: python -m src.fetch.understat
+Files are written to data/raw/understat/{league}/{year}.json.
+
+Usage: python -m src.fetch.understat [--league KEY] [--force]
 """
 import json
 import sys
@@ -17,14 +19,19 @@ import sys
 import config
 from src.fetch.http import get_text, polite_sleep
 
-LEAGUE_SLUG = "Serie_A"
-DATA_URL = f"https://understat.com/getLeagueData/{LEAGUE_SLUG}/{{year}}"
 
-# The AJAX endpoint rejects plain requests (404) unless these are present.
-XHR_HEADERS = {
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": f"https://understat.com/league/{LEAGUE_SLUG}",
-}
+def _data_url(league: str) -> str:
+    slug = config.LEAGUES[league]["understat_slug"]
+    return f"https://understat.com/getLeagueData/{slug}/{{year}}"
+
+
+def _xhr_headers(league: str) -> dict:
+    # The AJAX endpoint rejects plain requests (404) unless these are present.
+    slug = config.LEAGUES[league]["understat_slug"]
+    return {
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://understat.com/league/{slug}",
+    }
 
 
 def extract_matches(data: dict) -> list[dict]:
@@ -40,36 +47,40 @@ def extract_matches(data: dict) -> list[dict]:
     return []
 
 
-def fetch_season(season: str, force: bool = False) -> str | None:
-    """Fetch one season's Understat JSON. Returns path, or None on 404."""
-    config.UNDERSTAT_DIR.mkdir(parents=True, exist_ok=True)
+def fetch_season(season: str, league: str = config.DEFAULT_LEAGUE, force: bool = False) -> str | None:
+    """Fetch one season's Understat JSON for a league. Returns path, or None on 404."""
+    out_dir = config.league_dir("understat", league)
+    out_dir.mkdir(parents=True, exist_ok=True)
     year = config.understat_year(season)
-    out_path = config.UNDERSTAT_DIR / f"{year}.json"
+    out_path = out_dir / f"{year}.json"
     if out_path.exists() and out_path.stat().st_size > 0 and not force:
-        print(f"[skip] {season} (cached)")
+        print(f"[skip] {league} {season} (cached)")
         return str(out_path)
 
-    url = DATA_URL.format(year=year)
+    url = _data_url(league).format(year=year)
     try:
-        text = get_text(url, extra_headers=XHR_HEADERS)
+        text = get_text(url, extra_headers=_xhr_headers(league))
     except FileNotFoundError:
-        print(f"[404]  {season} — not published yet")
+        print(f"[404]  {league} {season} — not published yet")
         return None
 
     data = json.loads(text)
     n = len(extract_matches(data))
     out_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    print(f"[ok]   {season} ({n} matches) -> {out_path.relative_to(config.WORKSPACE)}")
+    print(f"[ok]   {league} {season} ({n} matches) -> {out_path.relative_to(config.WORKSPACE)}")
     return str(out_path)
 
 
-def fetch_all(force: bool = False):
-    for i, season in enumerate(config.SEASONS):
+def fetch_all(league: str = config.DEFAULT_LEAGUE, force: bool = False):
+    for i, season in enumerate(config.LEAGUES[league]["seasons"]):
         if i > 0:
             polite_sleep()
-        fetch_season(season, force=force)
+        fetch_season(season, league=league, force=force)
 
 
 if __name__ == "__main__":
     force = "--force" in sys.argv
-    fetch_all(force=force)
+    league = config.DEFAULT_LEAGUE
+    if "--league" in sys.argv:
+        league = sys.argv[sys.argv.index("--league") + 1]
+    fetch_all(league=league, force=force)

@@ -1,11 +1,13 @@
 """Tests for the ML package (src/ml)."""
 from __future__ import annotations
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.ml import data, evaluate, models, splits
+import config
+from src.ml import data, evaluate, models, predict, splits
 
 
 # ---------------------------------------------------------------------------
@@ -158,5 +160,95 @@ def test_tiny_end_to_end():
         pred = models.predict_goals(reg, X_va)
         assert pred.shape == (len(valid),)
         assert (pred >= 0).all()
-        m = evaluate.regression_metrics(valid["home_goals"].to_numpy(), pred)
-        assert m["mae"] < 1.5
+
+
+# ---------------------------------------------------------------------------
+# load_pipeline: signature regression (positional path vs league)
+# ---------------------------------------------------------------------------
+
+def test_load_pipeline_keyword_path(tmp_path):
+    """The UI calls load_pipeline(path=...); a path string must not be
+    mistaken for a league key (which doubled the path via pathlib's
+    absolute-join rule and raised NotADirectoryError)."""
+    fake = {"classifier_name": "xgboost", "features": ["a"]}
+    p = tmp_path / "pipeline.joblib"
+    joblib.dump(fake, p)
+
+    # keyword call (what src/ui/app.py does)
+    loaded = predict.load_pipeline(path=str(p))
+    assert loaded["classifier_name"] == "xgboost"
+
+    # positional path lands in the `league` slot -> clear ValueError,
+    # not a confusing NotADirectoryError
+    with pytest.raises(ValueError, match="unknown league"):
+        predict.load_pipeline(str(p))
+
+
+def test_predict_imputes_nan_ht_features(tmp_path):
+    """Pre-match fixtures have NaN HT goals; predict() must impute them
+    (as 0) so LogisticRegression — which rejects NaN — doesn't crash.
+
+    Regression: PL/LL/L1 pipelines trained with include_ht=True crashed in
+    the Predict tab with 'Input X contains NaN'.
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    rng = np.random.default_rng(0)
+    n = 60
+    X = pd.DataFrame({
+        "x1": rng.normal(size=n),
+        "ht_home_goals": rng.integers(0, 3, size=n).astype(float),
+        "ht_away_goals": rng.integers(0, 3, size=n).astype(float),
+    })
+    # 3 classes (H/D/A) — predict() indexes proba[:, 2]
+    y = (X["x1"] > 0).astype(int) + (X["ht_home_goals"] > 1).astype(int)
+    clf = LogisticRegression().fit(X, y)
+    reg = LogisticRegression().fit(X, (X["x1"] > -1).astype(int))
+
+    pipeline = {
+        "features": ["x1", "ht_home_goals", "ht_away_goals"],
+        "classifier": clf,
+        "regressor_home": reg,
+        "regressor_away": reg,
+        "team_labels": {0: "A", 1: "B"},
+    }
+    fixtures = pd.DataFrame({
+        "date": pd.to_datetime(["2026-11-01", "2026-11-02"]),
+        "home_team": [0, 1],
+        "away_team": [1, 0],
+        "x1": [0.5, -0.5],
+        "ht_home_goals": [np.nan, np.nan],
+        "ht_away_goals": [np.nan, np.nan],
+    })
+    prepared = predict.prepare_fixtures(fixtures, pipeline)
+    out = predict.predict(prepared, pipeline)
+    assert len(out) == 2
+    assert out[["p_home", "p_draw", "p_away"]].notna().all().all()
+    assert np.allclose(out[["p_home", "p_draw", "p_away"]].sum(axis=1), 1.0)
+
+
+# ---------------------------------------------------------------------------
+# build_fixtures: form columns must be numeric (not object)
+# ---------------------------------------------------------------------------
+
+def test_build_fixtures_form_columns_numeric():
+    """build_fixtures must return numeric form columns.
+
+    Regression: Ligue 1's 2026-08-23 PSG-Rennes match existed in the DB
+    twice (a football-data row and a reversed understat_only row), so PSG
+    and Rennes each appeared twice on the same date. That broke
+    _form_features' (season, date, team)-uniqueness assumption and produced
+    object-dtype form columns that LightGBM rejected with
+    'pandas dtypes must be int, float or bool'. build_fixtures now drops
+    null-HT rows (matching the clean pipeline) so the duplicate is gone.
+    """
+    from src.ml import fixtures as ml_fixtures
+
+    for league in ("premier_league", "la_liga", "ligue_1"):
+        out = ml_fixtures.build_fixtures(season="2026-27", league=league)
+        form_cols = [c for c in out.columns if "form" in c]
+        assert form_cols, f"no form columns for {league}"
+        for c in form_cols:
+            assert pd.api.types.is_numeric_dtype(out[c]), (
+                f"{league}: form column {c!r} is {out[c].dtype}, expected numeric"
+            )

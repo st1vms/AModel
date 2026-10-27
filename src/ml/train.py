@@ -52,9 +52,10 @@ def _y(df: pd.DataFrame, col: str) -> np.ndarray:
     return df[col].to_numpy()
 
 
-def _valid_slice(valid: pd.DataFrame, exclude_2026_27: bool) -> pd.DataFrame:
-    if exclude_2026_27:
-        return valid[valid["season"] != "2026-27"]
+def _valid_slice(valid: pd.DataFrame, exclude_in_progress: bool,
+                 league: str = config.DEFAULT_LEAGUE) -> pd.DataFrame:
+    if exclude_in_progress:
+        return valid[valid["season"] != config.LEAGUES[league]["in_progress"]]
     return valid
 
 
@@ -114,6 +115,7 @@ def run_classifiers_single_split(
     split: Split,
     features: list[str],
     tuned: dict[str, dict],
+    league: str = config.DEFAULT_LEAGUE,
 ) -> tuple[list[dict], dict[str, object]]:
     """Train & evaluate all classifiers on the single split.
 
@@ -134,7 +136,7 @@ def run_classifiers_single_split(
         fitted[name] = model
         proba = model.predict_proba(X_valid)
         for tag, vdf in (("all", valid),
-                         ("no_2026_27", _valid_slice(valid, True))):
+                         ("no_in_progress", _valid_slice(valid, True, league))):
             m = evaluate.classification_metrics(
                 _y(vdf, "outcome"), model.predict_proba(_X(vdf, features)))
             results.append({
@@ -168,6 +170,7 @@ def run_regressors_single_split(
     split: Split,
     features: list[str],
     tuned: dict[str, dict],
+    league: str = config.DEFAULT_LEAGUE,
 ) -> tuple[list[dict], dict[str, object]]:
     """Train & evaluate all goal regressors on the single split."""
     train, valid = split.train, split.valid
@@ -183,7 +186,7 @@ def run_regressors_single_split(
             models.fit_regressor(model, X_train, y_train)
             fitted[f"{target}:{name}"] = model
             for tag, vdf in (("all", valid),
-                             ("no_2026_27", _valid_slice(valid, True))):
+                             ("no_in_progress", _valid_slice(valid, True, league))):
                 pred = models.predict_goals(model, _X(vdf, features))
                 m = evaluate.regression_metrics(_y(vdf, target), pred)
                 results.append({
@@ -289,6 +292,7 @@ def save_models(
     tuned: dict[str, dict],
     include_ht: bool,
     no_xg: bool,
+    league: str = config.DEFAULT_LEAGUE,
 ) -> dict[str, Path]:
     """Persist the best models + metadata as joblib artifacts."""
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -298,6 +302,7 @@ def save_models(
     best_away = reg_artifacts["fitted"][f"away_goals:{reg_artifacts['best']['away_goals']}"]
 
     pipeline = {
+        "league": league,
         "classifier": best_clf,
         "classifier_name": best_name,
         "regressor_home": best_home,
@@ -322,6 +327,7 @@ def save_models(
 # ---------------------------------------------------------------------------
 
 def run_training(
+    league: str = config.DEFAULT_LEAGUE,
     include_ht: bool = False,
     no_xg: bool = False,
     walk_forward: bool = False,
@@ -339,6 +345,7 @@ def run_training(
     Returns
     -------
     dict with keys:
+      league                        league key trained on
       clf_frame, reg_frame          single-split results (DataFrames)
       wf_clf_frame, wf_reg_frame    walk-forward per-fold results (or None)
       clf_agg_frame, reg_agg_frame  walk-forward aggregates (or None)
@@ -350,15 +357,16 @@ def run_training(
       season_counts                 {season: n_matches}
       split_info                    train/valid sizes and season ranges
     """
-    out_dir = Path(out_dir or config.ML_DIR)
+    out_dir = Path(out_dir or config.ml_dir(league))
     results_dir = out_dir / "results"
     models_dir = out_dir / "models"
     results_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
-    log(f"Loading data (include_ht={include_ht}, no_xg={no_xg}) ...")
+    log(f"Loading data for {config.LEAGUES[league]['name']} "
+        f"(include_ht={include_ht}, no_xg={no_xg}) ...")
     df, labels, features = data.load_data(
-        include_ht=include_ht, no_xg=no_xg)
+        league, include_ht=include_ht, no_xg=no_xg)
     log(f"  {len(df)} rows, {len(labels)} teams, {len(features)} features")
     season_counts = data.season_counts(df)
     log(f"  seasons: {season_counts}")
@@ -382,9 +390,11 @@ def run_training(
 
     # --- single split ---
     log("\nTraining classifiers (single split) ...")
-    clf_results, clf_art = run_classifiers_single_split(split, features, tuned)
+    clf_results, clf_art = run_classifiers_single_split(
+        split, features, tuned, league)
     log("Training regressors (single split) ...")
-    reg_results, reg_art = run_regressors_single_split(split, features, tuned)
+    reg_results, reg_art = run_regressors_single_split(
+        split, features, tuned, league)
 
     # --- calibration of the best classifier ---
     cal_row = run_calibration(split, features, clf_art["best_name"])
@@ -466,13 +476,14 @@ def run_training(
 
     # --- save models ---
     saved = save_models(models_dir, clf_art, reg_art, features, labels,
-                        tuned, include_ht, no_xg)
+                        tuned, include_ht, no_xg, league)
     for k, p in saved.items():
         log(f"  saved {k}: {p}")
 
     elapsed = time.time() - t0
     log(f"\nDone in {elapsed:.1f}s. Results in {results_dir}")
     return {
+        "league": league,
         "clf_frame": clf_frame,
         "reg_frame": reg_frame,
         "wf_clf_frame": wf_clf_frame,
@@ -494,6 +505,9 @@ def run_training(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--league", default=config.DEFAULT_LEAGUE,
+                    choices=list(config.LEAGUES),
+                    help="league to train on")
     ap.add_argument("--include-ht", action="store_true",
                     help="add halftime goals as features (leakage for pre-match)")
     ap.add_argument("--no-xg", action="store_true",
@@ -502,10 +516,12 @@ def main() -> int:
                     help="also run the expanding-window walk-forward")
     ap.add_argument("--skip-tuning", action="store_true",
                     help="use default hyperparameters (no grid search)")
-    ap.add_argument("--out-dir", default=str(config.ML_DIR))
+    ap.add_argument("--out-dir", default=None,
+                    help="output dir (default: data/export/ml/<league>)")
     args = ap.parse_args()
 
     run_training(
+        league=args.league,
         include_ht=args.include_ht,
         no_xg=args.no_xg,
         walk_forward=args.walk_forward,

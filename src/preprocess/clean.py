@@ -43,8 +43,6 @@ import pandas as pd
 
 import config
 
-DEFAULT_OUT = config.EXPORT_DIR / "ml" / "matches_clean.csv"
-
 # Columns that are metadata, not per-match predictive features.
 METADATA_COLS = ["season", "source", "xg_source", "flag"]
 
@@ -53,14 +51,16 @@ METADATA_COLS = ["season", "source", "xg_source", "flag"]
 # Loading
 # ---------------------------------------------------------------------------
 
-def load_matches(source: str | Path | None = None) -> pd.DataFrame:
-    """Load the merged match frame from the DB (default) or a CSV export."""
+def load_matches(source: str | Path | None = None, league: str | None = None) -> pd.DataFrame:
+    """Load the merged match frame for a league from the DB (default) or a CSV export."""
     if source is None:
+        if league is None:
+            league = config.DEFAULT_LEAGUE
         conn = sqlite3.connect(config.DB_PATH)
         try:
             df = pd.read_sql_query(
                 """
-                SELECT m.season, m.date,
+                SELECT m.league, m.season, m.date,
                        t1.name AS home_team, t2.name AS away_team,
                        m.home_goals, m.away_goals,
                        m.ht_home_goals, m.ht_away_goals,
@@ -70,8 +70,10 @@ def load_matches(source: str | Path | None = None) -> pd.DataFrame:
                 FROM matches m
                 JOIN teams t1 ON m.home_team_id = t1.team_id
                 JOIN teams t2 ON m.away_team_id = t2.team_id
+                WHERE m.league = ?
                 """,
                 conn,
+                params=(league,),
             )
         finally:
             conn.close()
@@ -210,6 +212,7 @@ def _form_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
         + 1 * (df["home_goals"] == df["away_goals"])
     )
 
+    has_league = "league" in df.columns
     long = pd.DataFrame(
         {
             "season": pd.concat([df["season"], df["season"]], ignore_index=True),
@@ -220,15 +223,21 @@ def _form_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
             "ga": pd.concat([df["away_goals"], df["home_goals"]], ignore_index=True).astype(float),
         }
     )
-    long = long.sort_values(["season", "team", "date"], kind="mergesort")
-    g = long.groupby(["season", "team"], sort=False)
+    if has_league:
+        long["league"] = pd.concat([df["league"], df["league"]], ignore_index=True)
+    grp = ["league", "season", "team"] if has_league else ["season", "team"]
+    sort_cols = (["league", "season", "team", "date"] if has_league
+                 else ["season", "team", "date"])
+    long = long.sort_values(sort_cols, kind="mergesort")
+    g = long.groupby(grp, sort=False)
     for src, dst in (("pts", "form_pts"), ("gf", "form_gf"), ("ga", "form_ga")):
         long[dst] = g[src].transform(
             lambda s: s.shift(1).rolling(window, min_periods=1).mean()
         )
     long = long.fillna({c: 0.0 for c in ("form_pts", "form_gf", "form_ga")})
 
-    # Map back: (season, date, team) is unique (one match per team per day).
+    # Map back: (season, date, team) is unique within a single-league frame
+    # (one match per team per day).
     home = long.set_index(["season", "date", "team"])[["form_pts", "form_gf", "form_ga"]]
     out = pd.DataFrame(index=df.index)
     out["home_form_pts"] = [
@@ -265,9 +274,14 @@ def add_features(df: pd.DataFrame, form_window: int = 5) -> pd.DataFrame:
     # --- temporal ---
     df["month"] = df["date"].dt.month
     df["day_of_week"] = df["date"].dt.day_of_week  # Mon=0 .. Sun=6
-    df["matchday"] = (
-        df.groupby("season")["date"].rank(method="dense").astype(int)
-    )
+    if "league" in df.columns:
+        df["matchday"] = (
+            df.groupby(["league", "season"])["date"].rank(method="dense").astype(int)
+        )
+    else:
+        df["matchday"] = (
+            df.groupby("season")["date"].rank(method="dense").astype(int)
+        )
 
     # --- differentials (home - away) ---
     df["shots_diff"] = df["shots_home"] - df["shots_away"]
@@ -318,6 +332,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--source", default=None,
                     help="CSV to load instead of the DB (default: data/amodel.db)")
+    ap.add_argument("--league", default=config.DEFAULT_LEAGUE,
+                    help="league registry key (default: %(default)s)")
     ap.add_argument("--encoding", choices=["label", "onehot", "target"],
                     default="label")
     ap.add_argument("--keep-flagged", action="store_true",
@@ -325,10 +341,12 @@ def main() -> int:
     ap.add_argument("--keep-metadata", action="store_true",
                     help="keep season/source/xg_source/flag columns")
     ap.add_argument("--form-window", type=int, default=5)
-    ap.add_argument("--out", default=str(DEFAULT_OUT))
+    ap.add_argument("--out", default=None,
+                    help="output CSV (default: per-league ml dir)")
     args = ap.parse_args()
 
-    raw = load_matches(args.source)
+    out_path = Path(args.out) if args.out else config.ml_dir(args.league) / "matches_clean.csv"
+    raw = load_matches(args.source, league=args.league)
     out, notes, label_map = prepare(
         raw,
         encoding=args.encoding,
@@ -337,7 +355,6 @@ def main() -> int:
         form_window=args.form_window,
     )
 
-    out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_path, index=False)
 

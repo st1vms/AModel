@@ -34,14 +34,17 @@ from src.ml.data import FEATURES, derive_season
 from src.preprocess.clean import add_features, label_codes, load_matches
 
 
-def load_scheduled(season: str) -> pd.DataFrame:
+def load_scheduled(
+    season: str,
+    league: str = config.DEFAULT_LEAGUE,
+) -> pd.DataFrame:
     """Scheduled (unplayed) matches for ``season`` from the raw Understat JSON.
 
     Returns a frame with columns ``date`` (datetime), ``home_team``,
     ``away_team`` (canonical names), sorted by date. Empty if the raw file
     is missing or has no scheduled entries.
     """
-    path = config.UNDERSTAT_DIR / f"{config.understat_year(season)}.json"
+    path = config.league_dir("understat", league) / f"{config.understat_year(season)}.json"
     if not path.exists():
         return pd.DataFrame(columns=["date", "home_team", "away_team"])
 
@@ -53,8 +56,8 @@ def load_scheduled(season: str) -> pd.DataFrame:
         dt = m.get("datetime")
         if not dt:
             continue
-        home = canonical_team(m["h"]["title"])
-        away = canonical_team(m["a"]["title"])
+        home = canonical_team(m["h"]["title"], league)
+        away = canonical_team(m["a"]["title"], league)
         rows.append({
             "date": pd.Timestamp(dt.split(" ")[0]),
             "home_team": home,
@@ -65,7 +68,7 @@ def load_scheduled(season: str) -> pd.DataFrame:
         return df
     # Keep only matches that actually belong to the requested season
     # (defensive: the file is keyed by start year, but verify by date).
-    df = df[df["date"].map(derive_season) == season]
+    df = df[df["date"].map(lambda d: derive_season(d, league)) == season]
     return df.sort_values("date", kind="mergesort").reset_index(drop=True)
 
 
@@ -102,6 +105,7 @@ def _league_averages(historical: pd.DataFrame) -> dict[str, float]:
 
 def build_fixtures(
     season: str,
+    league: str = config.DEFAULT_LEAGUE,
     n_matchdays: int | None = None,
     labels: dict[int, str] | None = None,
 ) -> pd.DataFrame:
@@ -111,6 +115,7 @@ def build_fixtures(
     ----------
     season: e.g. "2026-27". Scheduled matches are read from the raw
         Understat JSON for that season's start year.
+    league: league key (see ``config.LEAGUES``).
     n_matchdays: if given, keep only the first N matchdays (distinct dates,
         earliest first). None = all scheduled matches.
     labels: optional code -> team map (e.g. ``pipeline["team_labels"]``).
@@ -125,25 +130,34 @@ def build_fixtures(
     integer codes, and every column in ``src.ml.data.FEATURES``. Directly
     compatible with ``src.ml.predict.prepare_fixtures`` / ``predict``.
     """
-    scheduled = load_scheduled(season)
+    scheduled = load_scheduled(season, league)
     if scheduled.empty:
         raise ValueError(
             f"no scheduled matches found for {season} "
-            f"(check {config.UNDERSTAT_DIR / f'{config.understat_year(season)}.json'})"
+            f"(check {config.league_dir('understat', league) / f'{config.understat_year(season)}.json'})"
         )
     if n_matchdays is not None:
         first_dates = scheduled["date"].drop_duplicates().sort_values().head(n_matchdays)
         scheduled = scheduled[scheduled["date"].isin(first_dates)]
 
-    historical = load_matches()  # DB, team names, played matches only
+    historical = load_matches(league=league)  # DB, team names, played only
     historical = historical.copy()
     historical["date"] = pd.to_datetime(historical["date"])
+    # Match the clean pipeline: drop rows with null HT goals (e.g.
+    # understat_only rows). Otherwise a team can appear twice on the same
+    # date (once per source, possibly with home/away reversed), which breaks
+    # _form_features' assumption that (season, date, team) is unique and
+    # yields object-dtype form columns that LightGBM rejects.
+    ht_null = historical["ht_home_goals"].isna() | historical["ht_away_goals"].isna()
+    if ht_null.any():
+        historical = historical[~ht_null]
     avgs = _league_averages(historical)
     priors = _team_priors(historical)
 
     # Fixture rows: no goals yet; shots/xG filled with each team's own
     # role-specific historical averages (league average as fallback).
     fixtures = scheduled.copy()
+    fixtures["league"] = league
     fixtures["season"] = season
     fixtures["home_goals"] = float("nan")
     fixtures["away_goals"] = float("nan")
@@ -155,7 +169,7 @@ def build_fixtures(
     fixtures["xg_away"] = fixtures["away_team"].map(priors["away_xg"]).fillna(avgs["xg_away"])
     fixtures["_is_fixture"] = True
 
-    hist = historical[["season", "date", "home_team", "away_team",
+    hist = historical[["league", "season", "date", "home_team", "away_team",
                        "home_goals", "away_goals",
                        "shots_home", "shots_away", "xg_home", "xg_away"]].copy()
     hist["_is_fixture"] = False

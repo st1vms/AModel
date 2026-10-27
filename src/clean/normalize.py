@@ -4,13 +4,19 @@ The canonical map is the main data-quality risk: both football-data.co.uk and
 Understat use slightly different club names. We map every known variant to a
 single canonical name. Unknown names are logged (not silently dropped) so they
 can be added to the map.
+
+Maps are keyed by league so each league's clubs are canonicalized independently.
+Leagues without a curated map fall back to the stripped original name.
 """
 import re
 from datetime import datetime
 
-# Canonical name -> set of known aliases (lowercased for matching).
+import config
+
+# Per-league canonical maps: league -> {canonical name -> [aliases]}.
 # Canonical names are the official club names used in the DB.
-_CANONICAL: dict[str, list[str]] = {
+CANONICAL_BY_LEAGUE: dict[str, dict[str, list[str]]] = {
+    "serie_a": {
     "Inter": ["inter", "inter milan", "internazionale", "fc internazionale milano"],
     "AC Milan": ["milan", "ac milan", "a.c. milan", "associazione calcio milan"],
     "Juventus": ["juventus", "juve", "juventus turin", "juventus fc"],
@@ -58,36 +64,180 @@ _CANONICAL: dict[str, list[str]] = {
     "Ascoli": ["ascoli", "ascoli calcio", "ascoli picchio"],
     "Cittadella": ["cittadella", "cittadella calcio", "us cittadella"],
     "Frosinone": ["frosinone"],
+    },
+    "bundesliga": {
+    "Arminia Bielefeld": ["arminia bielefeld", "bielefeld"],
+    "Augsburg": ["augsburg"],
+    "Bayer Leverkusen": ["bayer leverkusen", "leverkusen"],
+    "Bayern Munich": ["bayern munich", "bayern"],
+    "Bochum": ["bochum"],
+    "Borussia Dortmund": ["borussia dortmund", "dortmund"],
+    "Borussia M.Gladbach": ["borussia m.gladbach", "borussia m'gladbach", "m'gladbach", "gladbach"],
+    "Darmstadt": ["darmstadt", "darmstadt 98"],
+    "Eintracht Frankfurt": ["eintracht frankfurt", "ein frankfurt", "frankfurt"],
+    "Elversberg": ["elversberg"],
+    "FC Cologne": ["fc cologne", "fc koln", "cologne", "koln"],
+    "FC Heidenheim": ["fc heidenheim", "heidenheim"],
+    "Fortuna Duesseldorf": ["fortuna duesseldorf", "fortuna dusseldorf", "fortuna düsseldorf"],
+    "Freiburg": ["freiburg"],
+    "Greuther Fuerth": ["greuther fuerth", "greuther furth", "greuther fürth", "fuerth", "furth"],
+    "Hamburger SV": ["hamburger sv", "hamburg"],
+    "Hannover 96": ["hannover 96", "hannover"],
+    "Hertha Berlin": ["hertha berlin", "hertha"],
+    "Hoffenheim": ["hoffenheim"],
+    "Holstein Kiel": ["holstein kiel", "kiel"],
+    "Ingolstadt": ["ingolstadt", "fc ingolstadt"],
+    "Mainz 05": ["mainz 05", "mainz"],
+    "Nuernberg": ["nuernberg", "nurnberg", "nürnberg"],
+    "Paderborn": ["paderborn", "sc paderborn"],
+    "RasenBallsport Leipzig": ["rasenballsport leipzig", "rb leipzig", "leipzig"],
+    "Schalke 04": ["schalke 04", "schalke"],
+    "St. Pauli": ["st. pauli", "st pauli"],
+    "Union Berlin": ["union berlin"],
+    "VfB Stuttgart": ["vfb stuttgart", "stuttgart"],
+    "Werder Bremen": ["werder bremen", "bremen"],
+    "Wolfsburg": ["wolfsburg"],
+    },
+    "premier_league": {
+    "Arsenal": ["arsenal"],
+    "Aston Villa": ["aston villa"],
+    "Bournemouth": ["bournemouth"],
+    "Brentford": ["brentford"],
+    "Brighton": ["brighton"],
+    "Burnley": ["burnley"],
+    "Cardiff": ["cardiff"],
+    "Chelsea": ["chelsea"],
+    "Coventry": ["coventry"],
+    "Crystal Palace": ["crystal palace"],
+    "Everton": ["everton"],
+    "Fulham": ["fulham"],
+    "Huddersfield": ["huddersfield"],
+    "Hull": ["hull"],
+    "Ipswich": ["ipswich"],
+    "Leeds": ["leeds"],
+    "Leicester": ["leicester"],
+    "Liverpool": ["liverpool"],
+    "Luton": ["luton"],
+    "Manchester City": ["manchester city", "man city"],
+    "Manchester United": ["manchester united", "man united"],
+    "Middlesbrough": ["middlesbrough"],
+    "Newcastle United": ["newcastle united", "newcastle"],
+    "Norwich": ["norwich"],
+    "Nottingham Forest": ["nottingham forest", "nott'm forest"],
+    "Sheffield United": ["sheffield united"],
+    "Southampton": ["southampton"],
+    "Stoke": ["stoke"],
+    "Sunderland": ["sunderland"],
+    "Swansea": ["swansea"],
+    "Tottenham": ["tottenham"],
+    "Watford": ["watford"],
+    "West Bromwich Albion": ["west bromwich albion", "west brom"],
+    "West Ham": ["west ham"],
+    "Wolverhampton Wanderers": ["wolverhampton wanderers", "wolves"],
+    },
+    "la_liga": {
+    "Alaves": ["alaves"],
+    "Almeria": ["almeria"],
+    "Athletic Club": ["athletic club", "ath bilbao"],
+    "Atletico Madrid": ["atletico madrid", "ath madrid"],
+    "Barcelona": ["barcelona"],
+    "Cadiz": ["cadiz"],
+    "Celta Vigo": ["celta vigo", "celta"],
+    "Deportivo La Coruna": ["deportivo la coruna", "la coruna"],
+    "Eibar": ["eibar"],
+    "Elche": ["elche"],
+    "Espanyol": ["espanyol", "espanol"],
+    "Getafe": ["getafe"],
+    "Girona": ["girona"],
+    "Granada": ["granada"],
+    "Las Palmas": ["las palmas"],
+    "Leganes": ["leganes"],
+    "Levante": ["levante"],
+    "Malaga": ["malaga"],
+    "Mallorca": ["mallorca"],
+    "Osasuna": ["osasuna"],
+    "Racing Santander": ["racing santander", "santander"],
+    "Rayo Vallecano": ["rayo vallecano", "vallecano"],
+    "Real Betis": ["real betis", "betis"],
+    "Real Madrid": ["real madrid"],
+    "Real Oviedo": ["real oviedo", "oviedo"],
+    "Real Sociedad": ["real sociedad", "sociedad"],
+    "Real Valladolid": ["real valladolid", "valladolid"],
+    "SD Huesca": ["sd huesca", "huesca"],
+    "Sevilla": ["sevilla"],
+    "Sporting Gijon": ["sporting gijon", "sp gijon"],
+    "Valencia": ["valencia"],
+    "Villarreal": ["villarreal"],
+    },
+    "ligue_1": {
+    "Ajaccio": ["ajaccio"],
+    "Amiens": ["amiens"],
+    "Angers": ["angers"],
+    "Auxerre": ["auxerre"],
+    "Bordeaux": ["bordeaux"],
+    "Brest": ["brest"],
+    "Caen": ["caen"],
+    "Clermont Foot": ["clermont foot", "clermont"],
+    "Dijon": ["dijon"],
+    "Guingamp": ["guingamp"],
+    "Le Havre": ["le havre"],
+    "Le Mans": ["le mans"],
+    "Lens": ["lens"],
+    "Lille": ["lille"],
+    "Lorient": ["lorient"],
+    "Lyon": ["lyon"],
+    "Marseille": ["marseille"],
+    "Metz": ["metz"],
+    "Monaco": ["monaco"],
+    "Montpellier": ["montpellier"],
+    "Nancy": ["nancy"],
+    "Nantes": ["nantes"],
+    "Nice": ["nice"],
+    "Nimes": ["nimes"],
+    "Paris FC": ["paris fc"],
+    "Paris Saint Germain": ["paris saint germain", "paris sg"],
+    "Reims": ["reims"],
+    "Rennes": ["rennes"],
+    "SC Bastia": ["sc bastia", "bastia"],
+    "Saint-Etienne": ["saint-etienne", "st etienne"],
+    "Strasbourg": ["strasbourg"],
+    "Toulouse": ["toulouse"],
+    "Troyes": ["troyes"],
+    },
 }
 
-# Build reverse lookup: alias (lower) -> canonical
-_ALIAS_TO_CANON: dict[str, str] = {}
-for canon, aliases in _CANONICAL.items():
-    _ALIAS_TO_CANON[canon.lower()] = canon
-    for a in aliases:
-        _ALIAS_TO_CANON[a.lower()] = canon
+# Build per-league reverse lookup: league -> {alias (lower) -> canonical}
+_ALIAS_TO_CANON: dict[str, dict[str, str]] = {}
+for _league, _map in CANONICAL_BY_LEAGUE.items():
+    _rev: dict[str, str] = {}
+    for canon, aliases in _map.items():
+        _rev[canon.lower()] = canon
+        for a in aliases:
+            _rev[a.lower()] = canon
+    _ALIAS_TO_CANON[_league] = _rev
 
 
-def canonical_team(name: str) -> str:
-    """Map a raw team name to its canonical form.
+def canonical_team(name: str, league: str = config.DEFAULT_LEAGUE) -> str:
+    """Map a raw team name to its canonical form for a league.
 
-    Falls back to the stripped original (title-cased) if unknown, so nothing is
-    silently dropped. Callers should log unknowns via `unknown_teams`.
+    Falls back to the stripped original if unknown, so nothing is silently
+    dropped. Callers should log unknowns via `unknown_teams`.
     """
     if name is None:
         return "UNKNOWN"
     key = str(name).strip().lower()
-    return _ALIAS_TO_CANON.get(key, str(name).strip())
+    return _ALIAS_TO_CANON.get(league, {}).get(key, str(name).strip())
 
 
-def unknown_teams(names: list[str]) -> set[str]:
-    """Return the set of names that have no canonical mapping."""
+def unknown_teams(names: list[str], league: str = config.DEFAULT_LEAGUE) -> set[str]:
+    """Return the set of names that have no canonical mapping for a league."""
+    rev = _ALIAS_TO_CANON.get(league, {})
     out = set()
     for n in names:
         if n is None:
             continue
         key = str(n).strip().lower()
-        if key not in _ALIAS_TO_CANON:
+        if key not in rev:
             out.add(str(n).strip())
     return out
 

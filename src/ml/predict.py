@@ -25,12 +25,21 @@ import pandas as pd
 import config
 from src.ml import data, models
 
-PIPELINE_PATH = config.ML_MODELS_DIR / "pipeline.joblib"
+# Legacy flat path (default league; new code should use the per-league dirs).
+PIPELINE_PATH = config.ml_models_dir(config.DEFAULT_LEAGUE) / "pipeline.joblib"
 
 
-def load_pipeline(path: str | Path | None = None) -> dict:
-    """Load the saved inference pipeline (models + metadata)."""
-    return joblib.load(path or PIPELINE_PATH)
+def load_pipeline(
+    league: str = config.DEFAULT_LEAGUE,
+    path: str | Path | None = None,
+) -> dict:
+    """Load the saved inference pipeline (models + metadata) for a league."""
+    if path is None and league not in config.LEAGUES:
+        raise ValueError(
+            f"unknown league {league!r} — expected one of "
+            f"{sorted(config.LEAGUES)}, or pass an explicit path=..."
+        )
+    return joblib.load(path or config.ml_models_dir(league) / "pipeline.joblib")
 
 
 def prepare_fixtures(
@@ -72,7 +81,14 @@ def predict(
     Returns a frame with: date, home_team, away_team, p_home, p_draw,
     p_away, outcome (H/D/A), expected_home_goals, expected_away_goals.
     """
-    X = fixtures[pipeline["features"]]
+    X = fixtures[pipeline["features"]].copy()
+    # Pre-match fixtures have no HT score yet, so HT feature columns are NaN.
+    # Impute 0 — the natural "no goals scored yet" state and the modal HT
+    # result — so estimators that don't accept NaN natively (LogisticRegression)
+    # don't crash. GBMs would tolerate the NaN, but 0 is a defensible prior.
+    ht_cols = [c for c in X.columns if c.startswith("ht_")]
+    if ht_cols:
+        X[ht_cols] = X[ht_cols].fillna(0.0)
     proba = pipeline["classifier"].predict_proba(X)
     exp_home = models.predict_goals(pipeline["regressor_home"], X)
     exp_away = models.predict_goals(pipeline["regressor_away"], X)
@@ -92,23 +108,29 @@ def predict(
     return out
 
 
-def demo_fixtures(n: int = 10) -> pd.DataFrame:
+def demo_fixtures(
+    league: str = config.DEFAULT_LEAGUE,
+    n: int = 10,
+) -> pd.DataFrame:
     """Build a demo fixtures frame: the last `n` matches in the clean data.
 
     Used as a sanity check — the model re-predicts recent results.
     """
-    df, _, _ = data.load_data()
+    df, _, _ = data.load_data(league)
     return df.tail(n).copy()
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--league", default=config.DEFAULT_LEAGUE,
+                    choices=list(config.LEAGUES),
+                    help="league the pipeline was trained on")
     ap.add_argument("--matches", default=None,
                     help="fixtures CSV (matches_clean.csv schema minus targets)")
     ap.add_argument("--demo", action="store_true",
                     help="re-predict the last 10 matches in the training data")
     ap.add_argument("--pipeline", default=None,
-                    help=f"path to pipeline.joblib (default: {PIPELINE_PATH})")
+                    help="path to pipeline.joblib (default: per-league path)")
     ap.add_argument("--out", default=None,
                     help="write predictions to this CSV (default: stdout only)")
     args = ap.parse_args()
@@ -116,9 +138,9 @@ def main() -> int:
     if not args.demo and not args.matches:
         ap.error("provide --matches PATH or --demo")
 
-    pipeline = load_pipeline(args.pipeline)
+    pipeline = load_pipeline(args.league, args.pipeline)
     if args.demo:
-        fixtures = demo_fixtures()
+        fixtures = demo_fixtures(args.league)
         print(f"Demo: re-predicting the last {len(fixtures)} matches "
               f"(classifier: {pipeline['classifier_name']}, "
               f"goal models: {pipeline['regressor_home_name']}/"

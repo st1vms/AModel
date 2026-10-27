@@ -21,6 +21,87 @@ def test_canonical_team_known_aliases():
     assert normalize.canonical_team("  Napoli  ") == "Napoli"
 
 
+def test_canonical_team_bundesliga_aliases():
+    """football-data short names must align with Understat full names.
+
+    Regression: an empty Bundesliga map left 234 matches/season unaligned
+    (understat_only), so their xG never merged in and LogisticRegression
+    hit NaNs during training.
+    """
+    pairs = [
+        ("Hertha", "Hertha Berlin"),
+        ("Ein Frankfurt", "Eintracht Frankfurt"),
+        ("M'gladbach", "Borussia M.Gladbach"),
+        ("Dortmund", "Borussia Dortmund"),
+        ("Leverkusen", "Bayer Leverkusen"),
+        ("Hamburg", "Hamburger SV"),
+        ("Hannover", "Hannover 96"),
+        ("Mainz", "Mainz 05"),
+        ("Nurnberg", "Nuernberg"),
+        ("RB Leipzig", "RasenBallsport Leipzig"),
+        ("St Pauli", "St. Pauli"),
+        ("Stuttgart", "VfB Stuttgart"),
+        ("FC Koln", "FC Cologne"),
+        ("Heidenheim", "FC Heidenheim"),
+        ("Bielefeld", "Arminia Bielefeld"),
+        ("Greuther Furth", "Greuther Fuerth"),
+        ("Fortuna Dusseldorf", "Fortuna Duesseldorf"),
+    ]
+    for fd_name, us_name in pairs:
+        assert normalize.canonical_team(fd_name, "bundesliga") == \
+            normalize.canonical_team(us_name, "bundesliga")
+
+
+def test_canonical_team_premier_league_aliases():
+    """football-data short names must align with Understat full names."""
+    pairs = [
+        ("Man City", "Manchester City"),
+        ("Man United", "Manchester United"),
+        ("Newcastle", "Newcastle United"),
+        ("Nott'm Forest", "Nottingham Forest"),
+        ("West Brom", "West Bromwich Albion"),
+        ("Wolves", "Wolverhampton Wanderers"),
+    ]
+    for fd_name, us_name in pairs:
+        assert normalize.canonical_team(fd_name, "premier_league") == \
+            normalize.canonical_team(us_name, "premier_league")
+
+
+def test_canonical_team_la_liga_aliases():
+    """football-data short names must align with Understat full names."""
+    pairs = [
+        ("Ath Bilbao", "Athletic Club"),
+        ("Ath Madrid", "Atletico Madrid"),
+        ("Betis", "Real Betis"),
+        ("Celta", "Celta Vigo"),
+        ("Espanol", "Espanyol"),
+        ("Huesca", "SD Huesca"),
+        ("La Coruna", "Deportivo La Coruna"),
+        ("Oviedo", "Real Oviedo"),
+        ("Santander", "Racing Santander"),
+        ("Sociedad", "Real Sociedad"),
+        ("Sp Gijon", "Sporting Gijon"),
+        ("Vallecano", "Rayo Vallecano"),
+        ("Valladolid", "Real Valladolid"),
+    ]
+    for fd_name, us_name in pairs:
+        assert normalize.canonical_team(fd_name, "la_liga") == \
+            normalize.canonical_team(us_name, "la_liga")
+
+
+def test_canonical_team_ligue_1_aliases():
+    """football-data short names must align with Understat full names."""
+    pairs = [
+        ("Bastia", "SC Bastia"),
+        ("Clermont", "Clermont Foot"),
+        ("Paris SG", "Paris Saint Germain"),
+        ("St Etienne", "Saint-Etienne"),
+    ]
+    for fd_name, us_name in pairs:
+        assert normalize.canonical_team(fd_name, "ligue_1") == \
+            normalize.canonical_team(us_name, "ligue_1")
+
+
 def test_canonical_team_unknown_falls_back():
     assert normalize.canonical_team("Some New Club") == "Some New Club"
     assert normalize.canonical_team(None) == "UNKNOWN"
@@ -57,19 +138,19 @@ def test_numeric_coercion():
 def test_merge_alignment_fixture(tmp_path, monkeypatch):
     """A football-data row and an Understat row for the same match must align."""
     import config
+    import json
 
-    fd_dir = tmp_path / "fd"
-    us_dir = tmp_path / "us"
-    fd_dir.mkdir()
-    us_dir.mkdir()
+    # merge() reads config.league_dir(source, league) = RAW_DIR/source/league
+    # and iterates config.LEAGUES[league]["seasons"].
+    (tmp_path / "football_data" / "serie_a").mkdir(parents=True)
+    (tmp_path / "understat" / "serie_a").mkdir(parents=True)
 
     csv_text = (
         "Date,HomeTeam,AwayTeam,FTHG,FTAG,HTHG,HTAG,HTR,Referee,HS,AS\n"
         "27/10/2026,Inter,Juventus,4,4,2,2,D,Ref A,15,12\n"
     )
-    (fd_dir / "2026-27.csv").write_text(csv_text, encoding="utf-8")
-
-    import json
+    (tmp_path / "football_data" / "serie_a" / "2026-27.csv").write_text(
+        csv_text, encoding="utf-8")
 
     us_data = {
         "dates": [
@@ -84,11 +165,11 @@ def test_merge_alignment_fixture(tmp_path, monkeypatch):
             }
         ]
     }
-    (us_dir / "2026.json").write_text(json.dumps(us_data), encoding="utf-8")
+    (tmp_path / "understat" / "serie_a" / "2026.json").write_text(
+        json.dumps(us_data), encoding="utf-8")
 
-    monkeypatch.setattr(config, "FOOTBALL_DATA_DIR", fd_dir)
-    monkeypatch.setattr(config, "UNDERSTAT_DIR", us_dir)
-    monkeypatch.setattr(config, "SEASONS", ["2026-27"])
+    monkeypatch.setattr(config, "RAW_DIR", tmp_path)
+    monkeypatch.setitem(config.LEAGUES["serie_a"], "seasons", ["2026-27"])
 
     df = merge()
     assert len(df) == 1  # aligned into a single match, not two
@@ -106,17 +187,16 @@ def test_merge_xg_fallback(tmp_path, monkeypatch):
     import config
     import json
 
-    fd_dir = tmp_path / "fd"
-    us_dir = tmp_path / "us"
-    fd_dir.mkdir()
-    us_dir.mkdir()
+    (tmp_path / "football_data" / "serie_a").mkdir(parents=True)
+    (tmp_path / "understat" / "serie_a").mkdir(parents=True)
 
     # 2016-17 CSV has no HxG/AxG columns
     csv_text = (
         "Date,HomeTeam,AwayTeam,FTHG,FTAG,HTHG,HTAG,HTR,Referee,HS,AS\n"
         "14/08/2016,Juventus,Napoli,2,1,1,0,H,Ref B,10,8\n"
     )
-    (fd_dir / "2016-17.csv").write_text(csv_text, encoding="utf-8")
+    (tmp_path / "football_data" / "serie_a" / "2016-17.csv").write_text(
+        csv_text, encoding="utf-8")
 
     us_data = {
         "dates": [
@@ -131,11 +211,11 @@ def test_merge_xg_fallback(tmp_path, monkeypatch):
             }
         ]
     }
-    (us_dir / "2016.json").write_text(json.dumps(us_data), encoding="utf-8")
+    (tmp_path / "understat" / "serie_a" / "2016.json").write_text(
+        json.dumps(us_data), encoding="utf-8")
 
-    monkeypatch.setattr(config, "FOOTBALL_DATA_DIR", fd_dir)
-    monkeypatch.setattr(config, "UNDERSTAT_DIR", us_dir)
-    monkeypatch.setattr(config, "SEASONS", ["2016-17"])
+    monkeypatch.setattr(config, "RAW_DIR", tmp_path)
+    monkeypatch.setitem(config.LEAGUES["serie_a"], "seasons", ["2016-17"])
 
     df = merge()
     assert len(df) == 1
@@ -184,16 +264,14 @@ def test_upsert_idempotent(tmp_path, monkeypatch):
     import config
     import json
 
-    fd_dir = tmp_path / "fd"
-    us_dir = tmp_path / "us"
-    fd_dir.mkdir()
-    us_dir.mkdir()
-    (fd_dir / "2026-27.csv").write_text(
+    (tmp_path / "football_data" / "serie_a").mkdir(parents=True)
+    (tmp_path / "understat" / "serie_a").mkdir(parents=True)
+    (tmp_path / "football_data" / "serie_a" / "2026-27.csv").write_text(
         "Date,HomeTeam,AwayTeam,FTHG,FTAG,HTHG,HTAG,HTR,Referee,HS,AS\n"
         "27/10/2026,Inter,Juventus,4,4,2,2,D,Ref A,15,12\n",
         encoding="utf-8",
     )
-    (us_dir / "2026.json").write_text(
+    (tmp_path / "understat" / "serie_a" / "2026.json").write_text(
         json.dumps(
             {
                 "dates": [
@@ -215,9 +293,8 @@ def test_upsert_idempotent(tmp_path, monkeypatch):
     db = tmp_path / "test.db"
     monkeypatch.setattr(config, "DB_PATH", db)
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(config, "FOOTBALL_DATA_DIR", fd_dir)
-    monkeypatch.setattr(config, "UNDERSTAT_DIR", us_dir)
-    monkeypatch.setattr(config, "SEASONS", ["2026-27"])
+    monkeypatch.setattr(config, "RAW_DIR", tmp_path)
+    monkeypatch.setitem(config.LEAGUES["serie_a"], "seasons", ["2026-27"])
 
     n1 = load()
     n2 = load()
@@ -226,4 +303,7 @@ def test_upsert_idempotent(tmp_path, monkeypatch):
     conn = sqlite3.connect(db)
     total = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
     assert total == n1  # second load added no duplicates
+    leagues = conn.execute(
+        "SELECT DISTINCT league FROM matches").fetchall()
+    assert leagues == [("serie_a",)]
     conn.close()

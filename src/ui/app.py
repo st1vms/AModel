@@ -37,7 +37,14 @@ from src.ml import predict as ml_predict
 from src.ml import train as ml_train
 from src.preprocess import clean as preprocess
 
-st.set_page_config(page_title="AModel — Serie A", page_icon="⚽", layout="wide")
+def _current_league() -> str:
+    """League selected in the previous run (for the page title)."""
+    return st.session_state.get("league", config.DEFAULT_LEAGUE)
+
+
+st.set_page_config(
+    page_title=f"AModel — {config.LEAGUES[_current_league()]['name']}",
+    page_icon="⚽", layout="wide")
 
 
 # ---------------------------------------------------------------------------
@@ -46,21 +53,29 @@ st.set_page_config(page_title="AModel — Serie A", page_icon="⚽", layout="wid
 
 @st.cache_data(show_spinner=False)
 def load_pipeline_cached(path: str):
-    return ml_predict.load_pipeline(path)
+    # Pass `path` by keyword: load_pipeline's first positional param is
+    # `league`, so a bare positional call would treat the path as a league key
+    # and double the path (ml_models_dir(<path>) / "pipeline.joblib").
+    return ml_predict.load_pipeline(path=path)
 
 
 @st.cache_data(show_spinner=False)
-def db_summary() -> dict:
-    """Quick status of the SQLite DB (match count, latest date, seasons)."""
+def db_summary(league: str) -> dict:
+    """Quick status of the SQLite DB for a league (count, latest, seasons)."""
     import sqlite3
     if not config.DB_PATH.exists():
         return {}
     conn = sqlite3.connect(config.DB_PATH)
     try:
-        n = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
-        latest = conn.execute("SELECT MAX(date) FROM matches").fetchone()[0]
+        n = conn.execute(
+            "SELECT COUNT(*) FROM matches WHERE league = ?", (league,)
+        ).fetchone()[0]
+        latest = conn.execute(
+            "SELECT MAX(date) FROM matches WHERE league = ?", (league,)
+        ).fetchone()[0]
         seasons = dict(conn.execute(
-            "SELECT season, COUNT(*) FROM matches GROUP BY season"
+            "SELECT season, COUNT(*) FROM matches "
+            "WHERE league = ? GROUP BY season", (league,)
         ).fetchall())
     finally:
         conn.close()
@@ -68,9 +83,9 @@ def db_summary() -> dict:
 
 
 @st.cache_data(show_spinner=False)
-def clean_csv_info() -> dict:
-    """Status of the ML-ready CSV (rows, latest date)."""
-    path = config.ML_DIR / "matches_clean.csv"
+def clean_csv_info(league: str) -> dict:
+    """Status of the ML-ready CSV for a league (rows, latest date)."""
+    path = config.ml_dir(league) / "matches_clean.csv"
     if not path.exists():
         return {}
     df = pd.read_csv(path, parse_dates=["date"], usecols=["date"])
@@ -83,17 +98,31 @@ def clean_csv_info() -> dict:
 # ---------------------------------------------------------------------------
 
 def sidebar() -> dict:
-    st.sidebar.title("⚽ AModel — Serie A")
-    st.sidebar.caption("2016-17 → 2026-27 · football-data.co.uk + Understat")
+    league = st.sidebar.selectbox(
+        "League", config.LEAGUE_ORDER,
+        format_func=lambda k: config.LEAGUES[k]["name"],
+        index=config.LEAGUE_ORDER.index(_current_league()),
+        help="League to train on and predict. Each league has its own raw "
+             "data, clean CSV, results and saved pipeline.")
+    st.session_state["league"] = league
+    spec = config.LEAGUES[league]
+
+    st.sidebar.title(f"⚽ AModel — {spec['name']}")
+    st.sidebar.caption(
+        f"{spec['seasons'][0]} → {spec['seasons'][-1]} · "
+        "football-data.co.uk + Understat"
+    )
 
     season = st.sidebar.selectbox(
-        "Season (for predictions)", config.SEASONS,
-        index=config.SEASONS.index(config.IN_PROGRESS_SEASON),
+        "Season (for predictions)", spec["seasons"],
+        index=spec["seasons"].index(spec["in_progress"]),
         help="Season whose scheduled fixtures will be predicted.")
+    max_md = config.max_matchdays(league)
     n_matchdays = st.sidebar.number_input(
-        "Matchdays to predict", min_value=1, max_value=38, value=1, step=1,
-        help="How many upcoming matchdays (distinct dates) to predict. "
-             "38 = the whole remaining season.")
+        "Matchdays to predict", min_value=1, max_value=max_md, value=1,
+        step=1,
+        help=f"How many upcoming matchdays (distinct dates) to predict. "
+             f"{max_md} = the whole remaining season.")
 
     st.sidebar.divider()
     st.sidebar.subheader("Training options")
@@ -112,10 +141,11 @@ def sidebar() -> dict:
 
     st.sidebar.divider()
     st.sidebar.caption(
-        f"DB: {config.DB_PATH.name} · models: {config.ML_MODELS_DIR.name}/"
-        f"pipeline.joblib"
+        f"DB: {config.DB_PATH.name} · models: "
+        f"{config.ml_models_dir(league).name}/pipeline.joblib"
     )
     return {
+        "league": league,
         "season": season,
         "n_matchdays": int(n_matchdays),
         "include_ht": include_ht,
@@ -129,15 +159,15 @@ def sidebar() -> dict:
 # Tab 1 — Update data
 # ---------------------------------------------------------------------------
 
-def _rebuild_clean_csv() -> tuple[int, list[str]]:
+def _rebuild_clean_csv(league: str) -> tuple[int, list[str]]:
     """DB -> clean/encode/feature-engineer -> matches_clean.csv + labels.
 
     Mirrors ``src/preprocess/clean.main`` (label encoding, default options).
     Returns (n_rows, notes).
     """
-    raw = preprocess.load_matches()  # from the DB
+    raw = preprocess.load_matches(league=league)  # from the DB
     out, notes, label_map = preprocess.prepare(raw, encoding="label")
-    out_path = config.ML_DIR / "matches_clean.csv"
+    out_path = config.ml_dir(league) / "matches_clean.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_path, index=False)
     if label_map is not None:
@@ -151,8 +181,9 @@ def _rebuild_clean_csv() -> tuple[int, list[str]]:
     return len(out), notes
 
 
-def tab_update() -> None:
-    st.subheader("Update data")
+def tab_update(opts: dict) -> None:
+    league = opts["league"]
+    st.subheader(f"Update data — {config.LEAGUES[league]['name']}")
     st.caption(
         "Fetches the latest football-data.co.uk CSVs and Understat JSON "
         "(network, ~1–2 min with polite delays), merges both sources, "
@@ -177,13 +208,13 @@ def tab_update() -> None:
             with contextlib.redirect_stdout(buf):
                 with st.status("Updating data…", expanded=True) as status:
                     status.write("**1/4** Fetching football-data.co.uk …")
-                    football_data_csv.fetch_all(force=force)
+                    football_data_csv.fetch_all(league, force=force)
                     status.write("**2/4** Fetching Understat …")
-                    understat.fetch_all(force=force)
+                    understat.fetch_all(league, force=force)
                     status.write("**3/4** Merging & upserting into SQLite …")
-                    n_loaded = upsert.load()
+                    n_loaded = upsert.load(league)
                     status.write(f"**4/4** Rebuilding `matches_clean.csv` …")
-                    n_rows, notes = _rebuild_clean_csv()
+                    n_rows, notes = _rebuild_clean_csv(league)
             status.update(label="Data updated", state="complete")
         except Exception as e:  # noqa: BLE001 — surface any stage failure
             st.error(f"Update failed: {e}")
@@ -202,8 +233,8 @@ def tab_update() -> None:
             st.caption(f"[note] {n}")
 
     # Current status.
-    db = db_summary()
-    cc = clean_csv_info()
+    db = db_summary(league)
+    cc = clean_csv_info(league)
     if db:
         c1, c2, c3 = st.columns(3)
         c1.metric("Matches in DB", db["n_matches"])
@@ -227,7 +258,8 @@ def tab_update() -> None:
 # ---------------------------------------------------------------------------
 
 def tab_train(opts: dict) -> None:
-    st.subheader("Train models")
+    league = opts["league"]
+    st.subheader(f"Train models — {config.LEAGUES[league]['name']}")
     st.caption(
         "Tune (light grid) → train all classifiers & goal regressors → "
         "evaluate (single split"
@@ -235,7 +267,7 @@ def tab_train(opts: dict) -> None:
         + ") → save `pipeline.joblib`. ~30 s with tuning, a few seconds "
         "without."
     )
-    cc = clean_csv_info()
+    cc = clean_csv_info(league)
     if not cc:
         st.info("Run **Update data** first (needs `matches_clean.csv`).")
         return
@@ -249,6 +281,7 @@ def tab_train(opts: dict) -> None:
         with st.spinner("Training… (this can take ~30 s with tuning)"):
             try:
                 res = ml_train.run_training(
+                    league=league,
                     include_ht=opts["include_ht"],
                     no_xg=opts["no_xg"],
                     walk_forward=opts["walk_forward"],
@@ -293,7 +326,7 @@ def tab_train(opts: dict) -> None:
             st.code("\n".join(lines))
     else:
         # Show the most recent saved results, if any.
-        results_dir = config.ML_RESULTS_DIR
+        results_dir = config.ml_results_dir(league)
         if (results_dir / "classification_single_split.csv").exists():
             st.markdown("#### Last saved results")
             st.dataframe(
@@ -320,7 +353,8 @@ def tab_train(opts: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def tab_predict(opts: dict) -> None:
-    st.subheader("Predict fixtures")
+    league = opts["league"]
+    st.subheader(f"Predict fixtures — {config.LEAGUES[league]['name']}")
     st.caption(
         "Pulls the scheduled (unplayed) matches of the selected season from "
         "the raw Understat JSON, fills shots/xG with each team's historical "
@@ -329,7 +363,7 @@ def tab_predict(opts: dict) -> None:
         "the 1X2 probabilities."
     )
 
-    pipeline_path = config.ML_MODELS_DIR / "pipeline.joblib"
+    pipeline_path = config.ml_models_dir(league) / "pipeline.joblib"
     if not pipeline_path.exists():
         st.info("No saved pipeline yet — run **Train** first.")
         return
@@ -344,8 +378,9 @@ def tab_predict(opts: dict) -> None:
     if pipeline.get("include_ht"):
         st.warning(
             "This pipeline uses HT goals as features — for pre-match "
-            "fixtures those are unknown (NaN). Train without "
-            "**Include HT goals** for pre-match predictions."
+            "fixtures those are unknown, so they are imputed as 0 "
+            "(no goals scored yet). For the cleanest pre-match "
+            "predictions, train without **Include HT goals**."
         )
 
     if st.button("🔮 Predict upcoming fixtures", type="primary"):
@@ -353,7 +388,8 @@ def tab_predict(opts: dict) -> None:
             # Encode teams with the saved pipeline's own label map so the
             # codes are guaranteed consistent with the trained models.
             fixtures = ml_fixtures.build_fixtures(
-                opts["season"], n_matchdays=opts["n_matchdays"],
+                opts["season"], league=league,
+                n_matchdays=opts["n_matchdays"],
                 labels=pipeline["team_labels"])
         except ValueError as e:
             st.error(str(e))
@@ -394,7 +430,7 @@ def tab_predict(opts: dict) -> None:
         st.dataframe(preds, width="stretch")
         st.download_button(
             "Download CSV", preds.to_csv(index=False).encode(),
-            file_name=f"predictions_{opts['season']}.csv",
+            file_name=f"predictions_{league}_{opts['season']}.csv",
             mime="text/csv")
 
 
@@ -406,7 +442,7 @@ def main() -> None:
     opts = sidebar()
     t1, t2, t3 = st.tabs(["📥 Update data", "🏋️ Train", "🔮 Predict"])
     with t1:
-        tab_update()
+        tab_update(opts)
     with t2:
         tab_train(opts)
     with t3:

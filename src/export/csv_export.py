@@ -1,7 +1,13 @@
-"""Export matches from SQLite to CSV (full + per-season).
+"""Export matches from SQLite to CSV (full + per-season, per-league).
 
-Usage: python -m src.export.csv_export
+Usage: python -m src.export.csv_export [--league KEY]
+
+Layout:
+- data/export/matches_full.csv            all leagues (league column included)
+- data/export/{league}/matches_full.csv   one league
+- data/export/{league}/{season}.csv       one league, one season
 """
+import argparse
 import sqlite3
 
 import pandas as pd
@@ -11,6 +17,7 @@ from src.db.upsert import get_conn
 
 QUERY = """
 SELECT
+    m.league,
     m.season,
     m.date,
     th.name AS home_team,
@@ -30,29 +37,44 @@ SELECT
 FROM matches m
 JOIN teams th ON th.team_id = m.home_team_id
 JOIN teams ta ON ta.team_id = m.away_team_id
-ORDER BY m.date, th.name
+ORDER BY m.league, m.date, th.name
 """
 
 
-def export() -> dict[str, int]:
-    """Write full + per-season CSVs. Returns {path: row_count}."""
+def export(league: str | None = None) -> dict[str, int]:
+    """Write full + per-season CSVs. Returns {path: row_count}.
+
+    league=None exports every league in the DB; otherwise only that league.
+    """
     config.EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     conn = get_conn()
     df = pd.read_sql_query(QUERY, conn)
     conn.close()
+    if league is not None:
+        df = df[df["league"] == league]
 
     counts: dict[str, int] = {}
     full = config.EXPORT_DIR / "matches_full.csv"
     df.to_csv(full, index=False)
     counts[str(full)] = len(df)
 
-    for season, sub in df.groupby("season"):
-        path = config.EXPORT_DIR / f"{season}.csv"
-        sub.to_csv(path, index=False)
-        counts[str(path)] = len(sub)
+    for lg, lg_df in df.groupby("league"):
+        lg_dir = config.EXPORT_DIR / lg
+        lg_dir.mkdir(parents=True, exist_ok=True)
+        lg_full = lg_dir / "matches_full.csv"
+        lg_df.to_csv(lg_full, index=False)
+        counts[str(lg_full)] = len(lg_df)
+        for season, sub in lg_df.groupby("season"):
+            path = lg_dir / f"{season}.csv"
+            sub.to_csv(path, index=False)
+            counts[str(path)] = len(sub)
     return counts
 
 
 if __name__ == "__main__":
-    for path, n in export().items():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--league", default=None,
+                    help="league registry key (default: all leagues in the DB)")
+    args = ap.parse_args()
+    for path, n in export(args.league).items():
         print(f"{n:4d}  {path}")

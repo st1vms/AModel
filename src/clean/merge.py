@@ -39,11 +39,12 @@ def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_football_data() -> pd.DataFrame:
-    """Load all cached football-data.co.uk CSVs into one DataFrame."""
+def load_football_data(league: str = config.DEFAULT_LEAGUE) -> pd.DataFrame:
+    """Load all cached football-data.co.uk CSVs for a league into one DataFrame."""
     frames = []
-    for season in config.SEASONS:
-        path = config.FOOTBALL_DATA_DIR / f"{season}.csv"
+    base = config.league_dir("football_data", league)
+    for season in config.LEAGUES[league]["seasons"]:
+        path = base / f"{season}.csv"
         if not path.exists():
             continue
         df = pd.read_csv(path, encoding="utf-8-sig")
@@ -89,12 +90,13 @@ def _understat_match_fields(m: dict) -> dict | None:
     return None
 
 
-def load_understat() -> pd.DataFrame:
-    """Load all cached Understat JSONs into one flat DataFrame."""
+def load_understat(league: str = config.DEFAULT_LEAGUE) -> pd.DataFrame:
+    """Load all cached Understat JSONs for a league into one flat DataFrame."""
     rows = []
-    for season in config.SEASONS:
+    base = config.league_dir("understat", league)
+    for season in config.LEAGUES[league]["seasons"]:
         year = config.understat_year(season)
-        path = config.UNDERSTAT_DIR / f"{year}.json"
+        path = base / f"{year}.json"
         if not path.exists():
             continue
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -113,15 +115,15 @@ def load_understat() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def merge() -> pd.DataFrame:
-    """Merge both sources into a unified match DataFrame.
+def merge(league: str = config.DEFAULT_LEAGUE) -> pd.DataFrame:
+    """Merge both sources for a league into a unified match DataFrame.
 
-    Columns: season, date, home_team, away_team, home_goals, away_goals,
+    Columns: league, season, date, home_team, away_team, home_goals, away_goals,
     ht_home_goals, ht_away_goals, shots_home, shots_away, xg_home, xg_away,
     referee, source, xg_source, flag
     """
-    fd = load_football_data()
-    us = load_understat()
+    fd = load_football_data(league)
+    us = load_understat(league)
 
     records = {}
     unknown = set()
@@ -130,9 +132,9 @@ def merge() -> pd.DataFrame:
     if not fd.empty:
         fd = fd.copy()
         fd["date_iso"] = fd["Date"].map(parse_date)
-        fd["home"] = fd["HomeTeam"].map(canonical_team)
-        fd["away"] = fd["AwayTeam"].map(canonical_team)
-        unknown |= unknown_teams(list(fd["HomeTeam"]) + list(fd["AwayTeam"]))
+        fd["home"] = fd["HomeTeam"].map(lambda n: canonical_team(n, league))
+        fd["away"] = fd["AwayTeam"].map(lambda n: canonical_team(n, league))
+        unknown |= unknown_teams(list(fd["HomeTeam"]) + list(fd["AwayTeam"]), league)
         for _, r in fd.iterrows():
             if r["date_iso"] is None:
                 continue
@@ -142,6 +144,7 @@ def merge() -> pd.DataFrame:
             key = (r["season_file"], r["home"], r["away"])
             has_xg = to_float_or_none(r.get("HxG")) is not None
             records[key] = {
+                "league": league,
                 "season": r["season_file"],
                 "date": r["date_iso"],
                 "home_team": r["home"],
@@ -162,14 +165,14 @@ def merge() -> pd.DataFrame:
 
     # --- Understat (xG fallback + cross-check) ---
     if not us.empty:
-        unknown |= unknown_teams(list(us["home"]) + list(us["away"]))
+        unknown |= unknown_teams(list(us["home"]) + list(us["away"]), league)
         for _, r in us.iterrows():
             if r["date"] is None:
                 continue
             # Align on (season_file, home, away): both sources are organized by
             # season file, and the two sources occasionally disagree on the
             # match date by a day, which would break a date-based key.
-            key = (r["season_file"], canonical_team(r["home"]), canonical_team(r["away"]))
+            key = (r["season_file"], canonical_team(r["home"], league), canonical_team(r["away"], league))
             if key in records:
                 rec = records[key]
                 # xG fallback for seasons where CSV lacks it
@@ -188,10 +191,11 @@ def merge() -> pd.DataFrame:
                         rec["flag"] = (rec["flag"] + ";" if rec["flag"] else "") + "score_mismatch"
             else:
                 records[key] = {
+                    "league": league,
                     "season": r["season_file"],
                     "date": r["date"],
-                    "home_team": canonical_team(r["home"]),
-                    "away_team": canonical_team(r["away"]),
+                    "home_team": canonical_team(r["home"], league),
+                    "away_team": canonical_team(r["away"], league),
                     "home_goals": to_int_or_none(r["goals_home"]),
                     "away_goals": to_int_or_none(r["goals_away"]),
                     "ht_home_goals": None,
@@ -215,6 +219,11 @@ def merge() -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    df = merge()
-    print(f"merged {len(df)} matches")
+    import sys
+
+    league = config.DEFAULT_LEAGUE
+    if "--league" in sys.argv:
+        league = sys.argv[sys.argv.index("--league") + 1]
+    df = merge(league)
+    print(f"merged {len(df)} matches for {league}")
     print(df.groupby("season").size())

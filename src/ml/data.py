@@ -1,7 +1,7 @@
 """Data loading & target/feature construction for the ML models.
 
 Reads the modeling-ready frame produced by ``src/preprocess/clean.py``
-(``data/export/ml/matches_clean.csv``) plus the team code map
+(``data/export/ml/<league>/matches_clean.csv``) plus the team code map
 (``team_labels.csv``), derives the missing ``season`` column from ``date``,
 and builds the classification/regression targets and feature matrix.
 
@@ -12,8 +12,9 @@ a match in month >= 7 belongs to the season *starting* that year
 (Aug 2016 -> 2016-17); a match in month <= 6 belongs to the season
 *ending* that year (May 2017 -> 2016-17).
 
-**Pandemic special case**: the 2019-20 season ran to Aug 2020, so matches
-dated 2020-06-01 .. 2020-08-31 must map to 2019-20, not 2020-21
+**Pandemic special case**: for leagues whose 2019-20 season ran to
+Aug 2020 (see ``config.LEAGUES[league]["pandemic_window"]``), matches
+dated inside that window must map to 2019-20, not 2020-21
 (2020-21 started in Sep 2020).
 """
 from __future__ import annotations
@@ -22,8 +23,9 @@ import pandas as pd
 
 import config
 
-MATCHES_CSV = config.ML_DIR / "matches_clean.csv"
-TEAM_LABELS_CSV = config.ML_DIR / "team_labels.csv"
+# Legacy flat paths (default league; new code should use the per-league dirs).
+MATCHES_CSV = config.ml_dir(config.DEFAULT_LEAGUE) / "matches_clean.csv"
+TEAM_LABELS_CSV = config.ml_dir(config.DEFAULT_LEAGUE) / "team_labels.csv"
 
 # Outcome labels (1X2): 0 = Home win, 1 = Draw, 2 = Away win
 OUTCOME_HOME, OUTCOME_DRAW, OUTCOME_AWAY = 0, 1, 2
@@ -45,31 +47,40 @@ FEATURES: list[str] = [
 # Optional halftime features (known only at HT -> leakage for pre-match use)
 HT_FEATURES: list[str] = ["ht_home_goals", "ht_away_goals"]
 
-# Pandemic window: 2019-20 season matches played Jun-Aug 2020.
-_PANDEMIC_START = pd.Timestamp("2020-06-01")
-_PANDEMIC_END = pd.Timestamp("2020-08-31")
+def _pandemic_window(league: str) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """Pandemic window for a league, or None if it had no such case."""
+    win = config.LEAGUES[league].get("pandemic_window")
+    if not win:
+        return None
+    return pd.Timestamp(win[0]), pd.Timestamp(win[1])
 
 
-def derive_season(date: pd.Timestamp) -> str:
+def derive_season(date: pd.Timestamp, league: str = config.DEFAULT_LEAGUE) -> str:
     """Map a match date to its season string (e.g. '2016-17').
 
     month >= 7 -> season starting that year; month <= 6 -> season ending
-    that year. Dates in the 2020 pandemic window map to 2019-20.
+    that year. Dates inside the league's pandemic window (if any) map to
+    2019-20.
     """
-    if _PANDEMIC_START <= date <= _PANDEMIC_END:
+    win = _pandemic_window(league)
+    if win and win[0] <= date <= win[1]:
         return "2019-20"
     if date.month >= 7:
         return f"{date.year}-{str(date.year + 1)[-2:]}"
     return f"{date.year - 1}-{str(date.year)[-2:]}"
 
 
-def load_team_labels(path: str | None = None) -> dict[int, str]:
-    """code -> team name map from team_labels.csv."""
-    df = pd.read_csv(path or TEAM_LABELS_CSV)
+def load_team_labels(
+    league: str = config.DEFAULT_LEAGUE,
+    path: str | None = None,
+) -> dict[int, str]:
+    """code -> team name map from team_labels.csv (per league)."""
+    df = pd.read_csv(path or config.ml_dir(league) / "team_labels.csv")
     return dict(zip(df["code"], df["team"]))
 
 
 def load_data(
+    league: str = config.DEFAULT_LEAGUE,
     path: str | None = None,
     include_ht: bool = False,
     no_xg: bool = False,
@@ -85,10 +96,11 @@ def load_data(
       features: the active feature list (FEATURES, optionally + HT,
           optionally minus xG columns).
     """
-    df = pd.read_csv(path or MATCHES_CSV, parse_dates=["date"])
-    labels = load_team_labels()
+    df = pd.read_csv(path or config.ml_dir(league) / "matches_clean.csv",
+                     parse_dates=["date"])
+    labels = load_team_labels(league, path=None)
 
-    df["season"] = df["date"].map(derive_season)
+    df["season"] = df["date"].map(lambda d: derive_season(d, league))
     df = df.sort_values(["date", "home_team"], kind="mergesort").reset_index(drop=True)
 
     # --- targets ---
