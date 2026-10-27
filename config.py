@@ -10,6 +10,11 @@ EXPORT_DIR = DATA_DIR / "export"
 TMP_DIR = WORKSPACE / ".tmp"
 DB_PATH = DATA_DIR / "amodel.db"
 
+# ML (src/ml): modeling-ready frame, results, and saved models
+ML_DIR = EXPORT_DIR / "ml"
+ML_RESULTS_DIR = ML_DIR / "results"
+ML_MODELS_DIR = ML_DIR / "models"
+
 # Seasons: 2016-17 through 2026-27 (2026-27 in progress as of 2026-10-27)
 SEASONS = [f"{y}-{str(y + 1)[-2:]}" for y in range(2016, 2027)]
 

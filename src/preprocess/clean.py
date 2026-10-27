@@ -343,8 +343,11 @@ def main() -> int:
 
     if label_map is not None:
         map_path = out_path.with_name("team_labels.csv")
+        # label_map is team -> code; emit (code, team) rows so the "code"
+        # column holds the int and "team" the name (matches load_team_labels).
         pd.DataFrame(
-            sorted(label_map.items(), key=lambda kv: kv[1]),
+            [(code, team) for team, code in sorted(label_map.items(),
+                                                   key=lambda kv: kv[1])],
             columns=["code", "team"],
         ).to_csv(map_path, index=False)
         notes.append(f"team label map saved: {map_path}")

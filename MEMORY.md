@@ -54,8 +54,21 @@ src/db/upsert.py          # get_conn(), load() -> idempotent upsert + seasons su
 src/export/csv_export.py  # export() -> data/export/matches_full.csv + per-season CSVs
 src/validate/checks.py    # run_checks() -> .tmp/validation_report.txt, exit 1 on hard errors
 src/preprocess/clean.py   # ML preprocessing: clean/encode/feature-engineer -> data/export/ml/matches_clean.csv
+src/ml/data.py            # load matches_clean.csv, derive season, targets/features
+src/ml/splits.py          # time_split (cutoff 2023-24) + walk_forward_splits (2022-23..2025-26)
+src/ml/models.py          # baselines + XGB/LGBM/CatBoost classifiers & goal regressors
+src/ml/evaluate.py        # log loss, ROC-AUC, accuracy, MAE/RMSE, aggregation
+src/ml/plots.py           # confusion matrix, feature importance, calibration curve
+src/ml/train.py           # CLI: tune -> train -> evaluate -> save models/plots
+                          #   + run_training() (structured dict for the UI)
+src/ml/predict.py         # CLI: inference with saved pipeline.joblib
+src/ml/fixtures.py        # build_fixtures(): scheduled (unplayed) matches ->
+                          #   prediction-ready frame (auto from raw Understat JSON)
+src/ui/app.py             # Streamlit UI: update data / train / predict (3 tabs)
 tests/test_pipeline.py    # 10 pytest tests
 tests/test_preprocess.py  # 12 pytest tests
+tests/test_ml.py          # ML tests (season derivation, splits, metrics, smoke)
+tests/test_ui.py          # UI tests (fixtures, run_training, app import)
 ```
 
 ### Key merge decisions
@@ -85,6 +98,10 @@ tests/test_preprocess.py  # 12 pytest tests
 .venv/bin/python -m src.validate.checks                     # validation report
 .venv/bin/python -m src.preprocess.clean [--encoding label|onehot|target]
         [--keep-flagged] [--keep-metadata] [--form-window 5] [--out PATH]
+.venv/bin/python -m src.ml.train [--include-ht] [--no-xg] [--walk-forward]
+        [--skip-tuning] [--out-dir PATH]
+.venv/bin/python -m src.ml.predict --demo | --matches fixtures.csv
+.venv/bin/python -m streamlit run src/ui/app.py             # Streamlit UI
 .venv/bin/python -m pytest tests/ -q                        # tests
 ```
 
@@ -112,6 +129,108 @@ modeling-ready CSV at `data/export/ml/matches_clean.csv`.
   raw team names) and `season` is dropped **after** features.
 - pandas 3.1: use `dt.day_of_week` (not `dt.dayofweek`).
 
+## ML models (src/ml)
+
+Plan: `implementation_plan_ml_models.md`. Trains 1X2 outcome classifiers and
+goal regressors on `matches_clean.csv` (3,879 rows, 34 teams, 11 seasons).
+
+- **Targets**: `outcome` (0=H, 1=D, 2=A; draws ~25% = imbalanced class),
+  `home_goals`/`away_goals` regression.
+- **Features**: 18 (team codes, month, day_of_week, matchday, shots, xG,
+  diffs, 5-match form pts/gf/ga). `--include-ht` adds HT goals (20 features),
+  `--no-xg` drops xG (14 features).
+- **Validation**: `time_split` cutoff 2023-24 (train 3,039 / valid 840,
+  includes 2026-27) + `walk_forward_splits` (4 folds, 2022-23..2025-26,
+  expanding window). `_check_leakage` guards date ordering.
+- **Models**: base_rate, logistic, xgboost, lightgbm, catboost (classification);
+  mean, poisson, xgboost, lightgbm, catboost (regression). Class imbalance via
+  inverse class weights (sample_weight / class_weights).
+- **Tuning**: light 16-combo grid (n_estimators, learning_rate, max_depth,
+  subsample) on the last train season (2023-24) held out from the fit;
+  `--skip-tuning` uses defaults.
+- **Calibration**: isotonic on the 2023-24 tuning slice, applied to the best
+  GBM before final evaluation.
+- **Outputs**: `data/export/ml/results/*.csv` (single_split, walk_forward,
+  tuning), `confusion_matrix.png`, `feature_importance.png`,
+  `calibration_curve.png`, `data/export/ml/models/pipeline.joblib`.
+- **Season derivation** (`data.derive_season`): month >= 7 -> season starting
+  that year; month <= 6 -> season ending that year; pandemic window
+  (2020-06-01..2020-08-31) -> 2019-20.
+
+### Results (2026-10-27, full run ~32s)
+
+Walk-forward aggregate (mean over 4 folds, 2022-23..2025-26):
+
+| model | log_loss | AUC (macro) | accuracy |
+|---|---|---|---|
+| base_rate | 1.0875 | 0.5000 | 0.4072 |
+| logistic | 0.8613 | 0.7783 | 0.6086 |
+| xgboost | 0.8627 | 0.7695 | 0.5993 |
+| lightgbm | 0.8627 | 0.7677 | 0.6007 |
+| catboost | **0.8605** | 0.7757 | 0.6039 |
+
+Single split (train ≤2023-24, test 2024-25..2026-27, 840 rows): catboost
+log_loss 0.8675 / AUC 0.7714 / acc 0.5976. All GBMs beat base rate by a wide
+margin; logistic is competitive (small-data regime).
+
+Goal regression (walk-forward MAE): best ~0.70 (away, lightgbm) / ~0.76
+(home, xgboost/catboost) vs mean baseline ~0.99-1.00. RMSE ~1.1-1.2.
+
+- **Caveat**: isotonic calibration on the 380-row 2023-24 slice *hurt* log loss
+  (catboost+isotonic 1.1122 vs 0.8675 uncalibrated) — overfit on the small
+  slice. Pipeline saves the uncalibrated best GBM; calibration is reported
+  separately in the results CSVs.
+- **Framework quirks** (XGBoost 3.4 / LightGBM 4.7 / CatBoost 1.2 / sklearn
+  1.9): XGB `early_stopping_rounds` in ctor (set `None` before plain fits);
+  LGBM `eval_X`/`eval_y` (not `eval_set`), `best_iteration_` is a 1-based tree
+  count (no +1); CatBoost `eval_metric="MultiClass"` (Logloss is binary-only),
+  `iterations`/`depth` param names (mapped in `_catboost_params`);
+  sklearn `CalibratedClassifierCV` needs `FrozenEstimator` (cv="prefit" gone);
+  `roc_auc_score` per-class = binary call, no `average`; `calibration_curve`
+  is binary-only (binarize y_true).
+
+## UI (src/ui — Streamlit)
+
+Streamlit app (only new dep: `streamlit>=1.30`) to update data, train, and
+predict without the CLI. Run: `.venv/bin/python -m streamlit run src/ui/app.py`.
+
+- **Tab 1 — Update data**: `football_data_csv.fetch_all(force)` →
+  `understat.fetch_all(force)` → `upsert.load()` → rebuild
+  `matches_clean.csv` + `team_labels.csv` (mirrors `preprocess.clean.main`).
+  Shows DB/clean-CSV metrics (cached via `st.cache_data`, cleared after update).
+- **Tab 2 — Train**: calls `train.run_training(...)` (new function extracted
+  from the old `main()`; same flow, returns a dict with result frames,
+  `best_name`, `saved` paths, `elapsed`, etc. and takes a `log` callable).
+  Renders result tables + the 3 PNGs; falls back to last saved results CSVs.
+- **Tab 3 — Predict**: `fixtures.build_fixtures(season, n_matchdays,
+  labels=pipeline["team_labels"])` → `predict.prepare_fixtures` →
+  `predict.predict`. Decodes codes→names for display, offers CSV download.
+  Sidebar: season, matchdays (1–38), include_ht / no_xg / walk_forward /
+  skip_tuning.
+
+### src/ml/fixtures.py — auto fixtures
+- `load_scheduled(season)`: reads `data/raw/understat/{start_year}.json`,
+  keeps `isResult is False` rows (the merged DB drops them), filters by
+  `derive_season(date) == season`, returns `date, home_team, away_team`
+  (canonical names), sorted by date.
+- `build_fixtures(season, n_matchdays=None, labels=None)`:
+  - shots/xG filled with **league averages** from played matches (best prior).
+  - form features via `add_features` on a combined historical+fixtures frame —
+    leakage-free because fixture dates are the latest in the season.
+  - team encoding: with `labels` (the saved pipeline's `team_labels`,
+    code→name) uses that map so codes match the trained models exactly
+    (unknown team → `ValueError`); without it, deterministic `label_codes`.
+  - returns `date, ht_*_goals (NaN)` + all `FEATURES`; team cols are int codes.
+
+### team_labels.csv column-order bug (fixed 2026-10-27)
+`label_map` is **team→code**, but the CSV writer wrote it with
+`columns=["code","team"]` — swapping the columns, so `load_team_labels()`
+returned `{name: code}` instead of the documented `{code: name}`. The saved
+pipeline therefore carried a name→code map. Fixed in **both** writers
+(`src/preprocess/clean.py` and `src/ui/app.py._rebuild_clean_csv`) to emit
+`(code, team)` rows; regenerated `team_labels.csv` and retrained so
+`pipeline.joblib` now carries `{code: name}`.
+
 ## Current status (2026-10-27)
 
 - **3880 matches** in DB: 380 × 10 completed seasons + 80 (in-progress 2026-27).
@@ -121,7 +240,7 @@ modeling-ready CSV at `data/export/ml/matches_clean.csv`.
   - 2022-23: 10 matches in June (season ended 2023-06-04).
   - 2023-24: 1 match in June (ended 2024-06-02).
   - 2026-27: 52 cross-source xG mismatches > 0.15 (football-data vs Understat xG models differ).
-- **22/22 tests pass** (10 pipeline + 12 preprocessing).
+- **43/43 tests pass** (10 pipeline + 12 preprocessing + 11 ML + 10 UI).
 - Spot-checks verified: 2024-25 champion **Napoli** (82 pts), Bologna 5-0 Lazio 2025-03-16, Inter 4-4 Juventus 2024-10-27.
 - Champions: 2016-17/17-18/18-19/19-20 Juventus, 2020-21 Inter, 2021-22 AC Milan, 2022-23 Napoli, 2023-24 Inter, 2024-25 Napoli, 2025-26 Inter.
 
@@ -133,3 +252,10 @@ modeling-ready CSV at `data/export/ml/matches_clean.csv`.
 ## Next (Phase 5)
 
 - FBref player-level enrichment → `players` + `player_match_stats` (Playwright MCP, optional `playwright` dep).
+
+## Done
+
+- **Streamlit UI** (`src/ui/app.py`) — update data / train / predict, 3 tabs.
+  Auto-fixture builder (`src/ml/fixtures.py`) recovers scheduled matches from
+  the raw Understat JSON. `train.run_training()` extracted for the UI.
+  Fixed the `team_labels.csv` column-order bug (see UI section).
