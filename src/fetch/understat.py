@@ -49,13 +49,20 @@ def extract_matches(data: dict) -> list[dict]:
 
 def fetch_season(season: str, league: str = config.DEFAULT_LEAGUE, force: bool = False) -> str | None:
     """Fetch one season's Understat JSON for a league. Returns path, or None on 404."""
+    spec = config.LEAGUES[league]
     out_dir = config.league_dir("understat", league)
     out_dir.mkdir(parents=True, exist_ok=True)
     year = config.understat_year(season)
     out_path = out_dir / f"{year}.json"
-    if out_path.exists() and out_path.stat().st_size > 0 and not force:
+    # The in-progress season is the only file that gains new matches (the
+    # source updates it in place), so it is always re-downloaded even when
+    # force=False; completed seasons stay cached. force=True re-downloads all.
+    is_in_progress = season == spec.get("in_progress")
+    if out_path.exists() and out_path.stat().st_size > 0 and not force and not is_in_progress:
         print(f"[skip] {league} {season} (cached)")
         return str(out_path)
+    if is_in_progress and not force:
+        print(f"[refresh] {league} {season} (in progress)")
 
     url = _data_url(league).format(year=year)
     try:

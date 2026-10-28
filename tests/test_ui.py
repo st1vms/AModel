@@ -123,6 +123,55 @@ def test_build_fixtures_shots_xg_are_team_specific():
 
 
 # ---------------------------------------------------------------------------
+# scheduled_matchdays
+# ---------------------------------------------------------------------------
+
+def test_scheduled_matchdays_shape_and_ordering():
+    mds = fixtures.scheduled_matchdays(config.IN_PROGRESS_SEASON)
+    assert not mds.empty
+    assert list(mds.columns) == ["date", "matchday"]
+    # Dates sorted ascending, one row per distinct scheduled date.
+    assert mds["date"].is_monotonic_increasing
+    assert mds["date"].is_unique
+    # Matchday numbers strictly increase (dense rank over distinct dates).
+    assert (mds["matchday"].diff().dropna() > 0).all()
+    assert (mds["matchday"] >= 1).all()
+    # First row is the current (earliest scheduled) matchday.
+    scheduled = fixtures.load_scheduled(config.IN_PROGRESS_SEASON)
+    assert mds["date"].iloc[0] == scheduled["date"].min()
+
+
+def test_scheduled_matchdays_finished_season_empty():
+    # 2016-17 is fully played -> no scheduled matchdays.
+    mds = fixtures.scheduled_matchdays("2016-17")
+    assert mds.empty
+    assert list(mds.columns) == ["date", "matchday"]
+
+
+# ---------------------------------------------------------------------------
+# build_fixtures(matchday=...)
+# ---------------------------------------------------------------------------
+
+def test_build_fixtures_matchday_only_that_date():
+    mds = fixtures.scheduled_matchdays(config.IN_PROGRESS_SEASON)
+    first_date = mds["date"].iloc[0]
+    out = fixtures.build_fixtures(config.IN_PROGRESS_SEASON, matchday=first_date)
+    assert not out.empty
+    # Only the selected date, and the full set of matches on it.
+    assert out["date"].nunique() == 1
+    assert out["date"].iloc[0] == first_date
+    scheduled = fixtures.load_scheduled(config.IN_PROGRESS_SEASON)
+    expected = int((scheduled["date"] == first_date).sum())
+    assert len(out) == expected
+
+
+def test_build_fixtures_matchday_unknown_raises():
+    with pytest.raises(ValueError, match="no scheduled matches on"):
+        fixtures.build_fixtures(
+            config.IN_PROGRESS_SEASON, matchday=pd.Timestamp("2099-01-01"))
+
+
+# ---------------------------------------------------------------------------
 # evaluate.table_to_string
 # ---------------------------------------------------------------------------
 

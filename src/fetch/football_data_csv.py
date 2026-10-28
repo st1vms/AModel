@@ -15,9 +15,15 @@ def fetch_season(season: str, league: str = config.DEFAULT_LEAGUE, force: bool =
     out_dir = config.league_dir("football_data", league)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{season}.csv"
-    if out_path.exists() and out_path.stat().st_size > 0 and not force:
+    # The in-progress season is the only file that gains new matches (the
+    # source updates it in place), so it is always re-downloaded even when
+    # force=False; completed seasons stay cached. force=True re-downloads all.
+    is_in_progress = season == spec.get("in_progress")
+    if out_path.exists() and out_path.stat().st_size > 0 and not force and not is_in_progress:
         print(f"[skip] {league} {season} (cached)")
         return str(out_path)
+    if is_in_progress and not force:
+        print(f"[refresh] {league} {season} (in progress)")
 
     url = config.FOOTBALL_DATA_URL.format(code=config.football_data_code(season), div=spec["fd_div"])
     try:

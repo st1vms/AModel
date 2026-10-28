@@ -116,13 +116,8 @@ def sidebar() -> dict:
     season = st.sidebar.selectbox(
         "Season (for predictions)", spec["seasons"],
         index=spec["seasons"].index(spec["in_progress"]),
-        help="Season whose scheduled fixtures will be predicted.")
-    max_md = config.max_matchdays(league)
-    n_matchdays = st.sidebar.number_input(
-        "Matchdays to predict", min_value=1, max_value=max_md, value=1,
-        step=1,
-        help=f"How many upcoming matchdays (distinct dates) to predict. "
-             f"{max_md} = the whole remaining season.")
+        help="Season whose scheduled fixtures will be predicted. The "
+             "matchday to predict is chosen on the Predict page.")
 
     st.sidebar.divider()
     st.sidebar.subheader("Training options")
@@ -147,7 +142,6 @@ def sidebar() -> dict:
     return {
         "league": league,
         "season": season,
-        "n_matchdays": int(n_matchdays),
         "include_ht": include_ht,
         "no_xg": no_xg,
         "walk_forward": walk_forward,
@@ -191,8 +185,11 @@ def tab_update(opts: dict) -> None:
     )
 
     force = st.checkbox(
-        "Force re-download (ignore local cache)", value=True,
-        help="Off = skip seasons whose raw files already exist.")
+        "Force re-download (ignore local cache)", value=False,
+        help="Off (default) = incremental: only the in-progress season is "
+             "re-downloaded (it is the only file that gains new matches); "
+             "completed seasons use the local cache. On = re-download every "
+             "season from scratch.")
 
     if st.button("⬇️ Fetch latest & rebuild", type="primary"):
         log_lines: list[str] = []
@@ -383,13 +380,35 @@ def tab_predict(opts: dict) -> None:
             "predictions, train without **Include HT goals**."
         )
 
+    # Matchday selector: one option per scheduled (unplayed) matchday of the
+    # season, labelled with the model's dense-rank matchday number and the
+    # date. The first option is the current (next) matchday, so it is
+    # auto-selected.
+    mds = ml_fixtures.scheduled_matchdays(opts["season"], league)
+    if mds.empty:
+        st.info(
+            "No scheduled matches for this season — run **Update data** "
+            "first."
+        )
+        return
+    md_options = [
+        (f"Matchday {int(r.matchday)} — {r.date.date()}", r.date)
+        for r in mds.itertuples(index=False)
+    ]
+    md_labels = [label for label, _ in md_options]
+    selected_label = st.selectbox(
+        "Matchday to predict", md_labels, index=0,
+        help="Only the matches on the selected matchday are predicted. "
+             "The first option is the current (next) matchday.")
+    selected_date = md_options[md_labels.index(selected_label)][1]
+
     if st.button("🔮 Predict upcoming fixtures", type="primary"):
         try:
             # Encode teams with the saved pipeline's own label map so the
             # codes are guaranteed consistent with the trained models.
             fixtures = ml_fixtures.build_fixtures(
                 opts["season"], league=league,
-                n_matchdays=opts["n_matchdays"],
+                matchday=selected_date,
                 labels=pipeline["team_labels"])
         except ValueError as e:
             st.error(str(e))
@@ -422,7 +441,10 @@ def tab_predict(opts: dict) -> None:
             "outcome", "expected_home_goals", "expected_away_goals",
         ]]
 
-        st.success(f"{len(preds)} fixtures predicted.")
+        st.success(
+            f"{len(preds)} fixtures predicted for {selected_label} "
+            f"({opts['season']})."
+        )
         st.caption(
             "Odds are fair decimal quotes (1 / probability) with no "
             "bookmaker margin."

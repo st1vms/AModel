@@ -73,6 +73,44 @@ def load_scheduled(
     return df.sort_values("date", kind="mergesort").reset_index(drop=True)
 
 
+def scheduled_matchdays(
+    season: str,
+    league: str = config.DEFAULT_LEAGUE,
+) -> pd.DataFrame:
+    """One row per scheduled (unplayed) matchday of ``season``.
+
+    Returns a frame with columns ``date`` (datetime, sorted ascending) and
+    ``matchday`` (int). ``matchday`` is the dense rank of the date among ALL
+    distinct dates of the season (played + scheduled) — the same convention
+    as the ``matchday`` feature in ``src/preprocess/clean.add_features`` — so
+    the labels match what the trained model sees. The first row is the
+    current (next) matchday. Empty if there are no scheduled matches.
+    """
+    scheduled = load_scheduled(season, league)
+    if scheduled.empty:
+        return pd.DataFrame(columns=["date", "matchday"])
+
+    sched_dates = scheduled["date"].drop_duplicates().sort_values()
+
+    # Played dates of the season (from the DB) so the dense rank counts the
+    # whole season, not just the remaining fixtures.
+    played = load_matches(league=league)
+    played_dates = pd.Series(
+        pd.to_datetime(played.loc[played["season"] == season, "date"])
+    ).drop_duplicates()
+
+    all_dates = (
+        pd.concat([sched_dates, played_dates], ignore_index=True)
+        .drop_duplicates()
+        .sort_values()
+    )
+    ranks = all_dates.rank(method="dense").astype(int)
+    return pd.DataFrame({
+        "date": sched_dates,
+        "matchday": sched_dates.map(dict(zip(all_dates, ranks))).astype(int),
+    }).reset_index(drop=True)
+
+
 def _team_priors(historical: pd.DataFrame) -> dict[str, pd.Series]:
     """Role-specific shots/xG priors per team, from played matches.
 
@@ -108,6 +146,7 @@ def build_fixtures(
     season: str,
     league: str = config.DEFAULT_LEAGUE,
     n_matchdays: int | None = None,
+    matchday: pd.Timestamp | str | None = None,
     labels: dict[int, str] | None = None,
 ) -> pd.DataFrame:
     """Build a prediction-ready frame of scheduled matches for ``season``.
@@ -118,7 +157,11 @@ def build_fixtures(
         Understat JSON for that season's start year.
     league: league key (see ``config.LEAGUES``).
     n_matchdays: if given, keep only the first N matchdays (distinct dates,
-        earliest first). None = all scheduled matches.
+        earliest first). None = all scheduled matches. Ignored when
+        ``matchday`` is given.
+    matchday: if given (a date), keep only the scheduled matches on that
+        single date. Takes precedence over ``n_matchdays``. Raises
+        ``ValueError`` if no scheduled matches fall on that date.
     labels: optional code -> team map (e.g. ``pipeline["team_labels"]``).
         When given, teams are encoded with the saved pipeline's own map so
         the codes are guaranteed consistent with the trained models; an
@@ -137,7 +180,15 @@ def build_fixtures(
             f"no scheduled matches found for {season} "
             f"(check {config.league_dir('understat', league) / f'{config.understat_year(season)}.json'})"
         )
-    if n_matchdays is not None:
+    if matchday is not None:
+        # Single-matchday selection (takes precedence over n_matchdays).
+        scheduled = scheduled[scheduled["date"] == pd.Timestamp(matchday)]
+        if scheduled.empty:
+            raise ValueError(
+                f"no scheduled matches on {pd.Timestamp(matchday).date()} "
+                f"for {season}"
+            )
+    elif n_matchdays is not None:
         first_dates = scheduled["date"].drop_duplicates().sort_values().head(n_matchdays)
         scheduled = scheduled[scheduled["date"].isin(first_dates)]
 
