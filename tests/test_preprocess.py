@@ -29,8 +29,13 @@ def _sample() -> pd.DataFrame:
             "ht_away_goals": [0, 0, 0, 1],
             "shots_home": [10, 8, 15, 9],
             "shots_away": [5, 7, 4, 6],
+            "shots_on_target_home": [4, 3, 6, 3],
+            "shots_on_target_away": [2, 3, 1, 2],
             "xg_home": [1.2, 1.8, 2.5, 1.1],
             "xg_away": [0.4, 0.9, 0.3, 0.8],
+            "b365h": [1.8, 3.4, 1.5, 2.1],
+            "b365d": [3.3, 3.2, 3.6, 3.3],
+            "b365a": [4.5, 2.1, 5.0, 3.4],
             "referee": [None, None, None, None],
             "source": ["football-data"] * 4,
             "xg_source": ["understat"] * 4,
@@ -115,6 +120,135 @@ def test_form_features_leakage_free():
     fourth = feat.iloc[3]
     assert fourth["home_form_pts"] == 0.0
     assert fourth["away_form_pts"] == 0.0
+
+
+def test_rest_days_leakage_free():
+    df = _sample()
+    out, _ = pc.clean(df)
+    feat = pc.add_features(out)
+
+    # First match of the season: no history -> 7.0 for both sides.
+    first = feat.iloc[0]
+    assert first["rest_days_home"] == 7.0
+    assert first["rest_days_away"] == 7.0
+    assert first["is_midweek"] == 0
+
+    # Second match (08-27): 7 days after 08-20 for both teams.
+    second = feat.iloc[1]
+    assert second["rest_days_home"] == 7.0
+    assert second["rest_days_away"] == 7.0
+
+    # Third match (09-03): A last played 08-27 (7 days), B last played 08-27 (7 days).
+    third = feat.iloc[2]
+    assert third["rest_days_home"] == 7.0
+    assert third["rest_days_away"] == 7.0
+
+    # New season (2017-18): rest resets to 7.0 (no history in this season).
+    fourth = feat.iloc[3]
+    assert fourth["rest_days_home"] == 7.0
+    assert fourth["rest_days_away"] == 7.0
+
+
+def test_market_probs_devigged_and_sum_to_one():
+    df = _sample()
+    out, _ = pc.clean(df)
+    feat = pc.add_features(out)
+
+    # All three probabilities present, in (0, 1), and sum to 1.
+    for col in ("mkt_prob_home", "mkt_prob_draw", "mkt_prob_away"):
+        assert col in feat.columns
+        assert (feat[col] > 0).all() and (feat[col] < 1).all()
+    total = feat["mkt_prob_home"] + feat["mkt_prob_draw"] + feat["mkt_prob_away"]
+    assert (total - 1.0).abs().max() < 1e-9
+
+    # De-vigging: implied probs from raw odds are scaled down by the overround,
+    # so each market prob is <= the raw implied prob.
+    raw_h = 1.0 / out["b365h"]
+    assert (feat["mkt_prob_home"] <= raw_h + 1e-9).all()
+
+
+def test_market_probs_fallback_when_missing():
+    df = _sample()
+    out, _ = pc.clean(df)
+    out["b365h"] = None
+    out["b365d"] = None
+    out["b365a"] = None
+    feat = pc.add_features(out)
+    for col in ("mkt_prob_home", "mkt_prob_draw", "mkt_prob_away"):
+        assert (feat[col] == pytest.approx(1.0 / 3.0)).all()
+
+
+def test_elo_pre_match_and_persistent():
+    df = _sample()
+    out, _ = pc.clean(df)
+    feat = pc.add_features(out)
+
+    # First match: both teams at the initial 1500.
+    first = feat.iloc[0]
+    assert first["elo_home"] == 1500.0
+    assert first["elo_away"] == 1500.0
+    assert first["elo_diff"] == 0.0
+
+    # After A's 1-0 win, A's rating rises above 1500 and B's falls below.
+    # The second match's pre-match ratings reflect that update.
+    second = feat.iloc[1]
+    assert second["elo_home"] < 1500.0   # B (lost)
+    assert second["elo_away"] > 1500.0   # A (won)
+
+    # Elo persists across seasons: 2017-18 ratings are not reset to 1500.
+    fourth = feat.iloc[3]
+    assert fourth["elo_home"] != 1500.0
+    assert fourth["elo_away"] != 1500.0
+
+
+def test_xg_rolling_and_finishing_luck_leakage_free():
+    df = _sample()
+    out, _ = pc.clean(df)
+    feat = pc.add_features(out)
+
+    # First match: no history -> rolling values 0.0.
+    first = feat.iloc[0]
+    assert first["xg_diff_rolling"] == 0.0
+    assert first["finishing_luck_home"] == 0.0
+    assert first["finishing_luck_away"] == 0.0
+
+    # Second match: A's prior luck = goals(1) - xg(1.2) = -0.2; B's = 0 - 0.4 = -0.4.
+    second = feat.iloc[1]
+    assert second["finishing_luck_home"] == pytest.approx(-0.4)  # B
+    assert second["finishing_luck_away"] == pytest.approx(-0.2)  # A
+
+
+def test_xg_eff_falls_back_to_sot_proxy():
+    df = _sample()
+    out, _ = pc.clean(df)
+    out["xg_home"] = None
+    out["xg_away"] = None
+    feat = pc.add_features(out)
+    # With xG missing, xg_eff = shots_on_target * 0.33, so finishing luck is
+    # non-trivial (goals - SoT*0.33) rather than all zeros.
+    assert feat["finishing_luck_home"].abs().sum() > 0
+    assert feat["xg_diff_rolling"].abs().sum() > 0
+
+
+def test_soe_form_and_ppg_rolling_leakage_free():
+    df = _sample()
+    out, _ = pc.clean(df)
+    feat = pc.add_features(out)
+
+    # First match: no history -> 0.0.
+    first = feat.iloc[0]
+    assert first["home_form_soe"] == 0.0
+    assert first["away_form_soe"] == 0.0
+    assert first["ppg_rolling_home"] == 0.0
+    assert first["ppg_rolling_away"] == 0.0
+
+    # Second match: A's prior PPG = 3.0 (one win), B's = 0.0 (one loss).
+    second = feat.iloc[1]
+    assert second["ppg_rolling_home"] == pytest.approx(0.0)   # B
+    assert second["ppg_rolling_away"] == pytest.approx(3.0)   # A
+    # SoE form is on a 0-3 scale and bounded.
+    assert 0.0 <= second["home_form_soe"] <= 3.0
+    assert 0.0 <= second["away_form_soe"] <= 3.0
 
 
 def test_differentials():

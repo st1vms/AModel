@@ -31,7 +31,7 @@ TEAM_LABELS_CSV = config.ml_dir(config.DEFAULT_LEAGUE) / "team_labels.csv"
 OUTCOME_HOME, OUTCOME_DRAW, OUTCOME_AWAY = 0, 1, 2
 OUTCOME_NAMES = {OUTCOME_HOME: "H", OUTCOME_DRAW: "D", OUTCOME_AWAY: "A"}
 
-# Base feature set (18). Team codes are kept as-is: tree models treat them
+# Base feature set (34). Team codes are kept as-is: tree models treat them
 # as high-cardinality categoricals natively (CatBoost via cat_features).
 FEATURES: list[str] = [
     "home_team", "away_team",
@@ -42,6 +42,23 @@ FEATURES: list[str] = [
     "home_form_pts", "home_form_gf", "home_form_ga",
     "away_form_pts", "away_form_gf", "away_form_ga",
     "form_pts_diff",
+    # temporal
+    "rest_days_home", "rest_days_away", "is_midweek",
+    # rolling xG & finishing luck
+    "xg_diff_rolling", "finishing_luck_home", "finishing_luck_away",
+    # Elo
+    "elo_home", "elo_away", "elo_diff",
+    # strength-of-estimate weighted form & rolling PPG
+    "home_form_soe", "away_form_soe",
+    "ppg_rolling_home", "ppg_rolling_away",
+    # market (de-vigged B365 opening odds)
+    "mkt_prob_home", "mkt_prob_draw", "mkt_prob_away",
+]
+
+# xG-derived features dropped together with the raw xG columns when no_xg
+XG_FEATURES: list[str] = [
+    "xg_home", "xg_away", "xg_diff",
+    "xg_diff_rolling", "finishing_luck_home", "finishing_luck_away",
 ]
 
 # Optional halftime features (known only at HT -> leakage for pre-match use)
@@ -115,7 +132,7 @@ def load_data(
     if include_ht:
         feats += HT_FEATURES
     if no_xg:
-        feats = [f for f in feats if f not in ("xg_home", "xg_away", "xg_diff")]
+        feats = [f for f in feats if f not in XG_FEATURES]
     missing = [f for f in feats if f not in df.columns]
     if missing:
         raise ValueError(f"feature columns missing from data: {missing}")

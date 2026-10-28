@@ -65,7 +65,9 @@ def load_matches(source: str | Path | None = None, league: str | None = None) ->
                        m.home_goals, m.away_goals,
                        m.ht_home_goals, m.ht_away_goals,
                        m.shots_home, m.shots_away,
+                       m.shots_on_target_home, m.shots_on_target_away,
                        m.xg_home, m.xg_away,
+                       m.b365h, m.b365d, m.b365a,
                        m.referee, m.source, m.xg_source, m.flag
                 FROM matches m
                 JOIN teams t1 ON m.home_team_id = t1.team_id
@@ -136,9 +138,13 @@ def clean(
     # --- numeric coercion (defensive: exports may come back as object) ---
     for col in [
         "home_goals", "away_goals", "ht_home_goals", "ht_away_goals",
-        "shots_home", "shots_away", "xg_home", "xg_away",
+        "shots_home", "shots_away",
+        "shots_on_target_home", "shots_on_target_away",
+        "xg_home", "xg_away",
+        "b365h", "b365d", "b365a",
     ]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.sort_values(["date", "home_team"]).reset_index(drop=True)
     return df, notes
@@ -267,8 +273,208 @@ def _form_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     return out
 
 
+def _xg_eff(df: pd.DataFrame) -> pd.DataFrame:
+    """Effective xG per side: real xG when available, else shots_on_target * 0.33."""
+    out = pd.DataFrame(index=df.index)
+    sot_h = df.get("shots_on_target_home")
+    sot_a = df.get("shots_on_target_away")
+    if sot_h is not None:
+        out["xg_eff_home"] = df["xg_home"].fillna(sot_h * 0.33)
+    else:
+        out["xg_eff_home"] = df["xg_home"].fillna(0.0)
+    if sot_a is not None:
+        out["xg_eff_away"] = df["xg_away"].fillna(sot_a * 0.33)
+    else:
+        out["xg_eff_away"] = df["xg_away"].fillna(0.0)
+    return out
+
+
+def _rest_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Days since last match (same season, same team). First match -> 7.0."""
+    has_league = "league" in df.columns
+    long = pd.DataFrame(
+        {
+            "season": pd.concat([df["season"], df["season"]], ignore_index=True),
+            "date": pd.concat([df["date"], df["date"]], ignore_index=True),
+            "team": pd.concat([df["home_team"], df["away_team"]], ignore_index=True),
+        }
+    )
+    if has_league:
+        long["league"] = pd.concat([df["league"], df["league"]], ignore_index=True)
+    grp = ["league", "season", "team"] if has_league else ["season", "team"]
+    sort_cols = (["league", "season", "team", "date"] if has_league
+                 else ["season", "team", "date"])
+    long = long.sort_values(sort_cols, kind="mergesort")
+    g = long.groupby(grp, sort=False)
+    long["rest_days"] = g["date"].transform(lambda s: s.diff().dt.days).fillna(7.0)
+
+    home = long.set_index(["season", "date", "team"])["rest_days"]
+    out = pd.DataFrame(index=df.index)
+    out["rest_days_home"] = [
+        home.loc[(s, d, t)]
+        for s, d, t in zip(df["season"], df["date"], df["home_team"])
+    ]
+    out["rest_days_away"] = [
+        home.loc[(s, d, t)]
+        for s, d, t in zip(df["season"], df["date"], df["away_team"])
+    ]
+    out["is_midweek"] = ((out["rest_days_home"] <= 4) | (out["rest_days_away"] <= 4)).astype(int)
+    return out
+
+
+def _xg_rolling_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+    """Rolling xG differential and finishing luck (goals - xg_eff), leakage-free."""
+    xg_eff = _xg_eff(df)
+    has_league = "league" in df.columns
+    long = pd.DataFrame(
+        {
+            "season": pd.concat([df["season"], df["season"]], ignore_index=True),
+            "date": pd.concat([df["date"], df["date"]], ignore_index=True),
+            "team": pd.concat([df["home_team"], df["away_team"]], ignore_index=True),
+            "xg_for": pd.concat([xg_eff["xg_eff_home"], xg_eff["xg_eff_away"]], ignore_index=True),
+            "xg_against": pd.concat([xg_eff["xg_eff_away"], xg_eff["xg_eff_home"]], ignore_index=True),
+            "goals_for": pd.concat([df["home_goals"], df["away_goals"]], ignore_index=True).astype(float),
+        }
+    )
+    if has_league:
+        long["league"] = pd.concat([df["league"], df["league"]], ignore_index=True)
+    grp = ["league", "season", "team"] if has_league else ["season", "team"]
+    sort_cols = (["league", "season", "team", "date"] if has_league
+                 else ["season", "team", "date"])
+    long = long.sort_values(sort_cols, kind="mergesort")
+    g = long.groupby(grp, sort=False)
+
+    roll_for = g["xg_for"].transform(lambda s: s.shift(1).rolling(window, min_periods=1).mean())
+    roll_against = g["xg_against"].transform(lambda s: s.shift(1).rolling(window, min_periods=1).mean())
+    long["roll_xg_diff"] = roll_for - roll_against
+    long["luck"] = long["goals_for"] - long["xg_for"]
+    long["roll_luck"] = g["luck"].transform(lambda s: s.shift(1).rolling(window, min_periods=1).mean())
+    long = long.fillna({"roll_xg_diff": 0.0, "roll_luck": 0.0})
+
+    home = long.set_index(["season", "date", "team"])[["roll_xg_diff", "roll_luck"]]
+    out = pd.DataFrame(index=df.index)
+    out["xg_diff_rolling"] = [
+        home.loc[(s, d, th), "roll_xg_diff"] - home.loc[(s, d, ta), "roll_xg_diff"]
+        for s, d, th, ta in zip(df["season"], df["date"], df["home_team"], df["away_team"])
+    ]
+    out["finishing_luck_home"] = [
+        home.loc[(s, d, t), "roll_luck"]
+        for s, d, t in zip(df["season"], df["date"], df["home_team"])
+    ]
+    out["finishing_luck_away"] = [
+        home.loc[(s, d, t), "roll_luck"]
+        for s, d, t in zip(df["season"], df["date"], df["away_team"])
+    ]
+    return out
+
+
+def _elo_ratings(df: pd.DataFrame, k: float = 20.0) -> pd.DataFrame:
+    """Pre-match Elo ratings, chronological across all seasons (persistent).
+
+    Ratings are recorded *before* each match (leakage-free) and updated
+    afterwards. They persist across seasons so a team's strength carries over.
+    """
+    order = df.sort_values(["date", "home_team"], kind="mergesort")
+    elo: dict[str, float] = {}
+    elo_home: list[float] = []
+    elo_away: list[float] = []
+    for _, r in order.iterrows():
+        h, a = r["home_team"], r["away_team"]
+        eh = elo.get(h, 1500.0)
+        ea = elo.get(a, 1500.0)
+        elo_home.append(eh)
+        elo_away.append(ea)
+        expected = 1.0 / (1.0 + 10 ** ((ea - eh) / 400.0))
+        if pd.notna(r["home_goals"]) and pd.notna(r["away_goals"]):
+            if r["home_goals"] > r["away_goals"]:
+                sh = 1.0
+            elif r["home_goals"] < r["away_goals"]:
+                sh = 0.0
+            else:
+                sh = 0.5
+            elo[h] = eh + k * (sh - expected)
+            elo[a] = ea + k * ((1 - sh) - (1 - expected))
+    out = pd.DataFrame(index=df.index)
+    out["elo_home"] = pd.Series(elo_home, index=order.index).reindex(df.index)
+    out["elo_away"] = pd.Series(elo_away, index=order.index).reindex(df.index)
+    out["elo_diff"] = out["elo_home"] - out["elo_away"]
+    return out
+
+
+def _soe_form_features(df: pd.DataFrame, elo: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+    """Opponent-Elo-weighted rolling form and rolling PPG, leakage-free."""
+    has_league = "league" in df.columns
+    home_pts = (
+        3 * (df["home_goals"] > df["away_goals"])
+        + 1 * (df["home_goals"] == df["away_goals"])
+    )
+    away_pts = (
+        3 * (df["away_goals"] > df["home_goals"])
+        + 1 * (df["away_goals"] == df["home_goals"])
+    )
+    long = pd.DataFrame(
+        {
+            "season": pd.concat([df["season"], df["season"]], ignore_index=True),
+            "date": pd.concat([df["date"], df["date"]], ignore_index=True),
+            "team": pd.concat([df["home_team"], df["away_team"]], ignore_index=True),
+            "pts": pd.concat([home_pts, away_pts], ignore_index=True).astype(float),
+            "opp_elo": pd.concat([elo["elo_away"], elo["elo_home"]], ignore_index=True),
+        }
+    )
+    if has_league:
+        long["league"] = pd.concat([df["league"], df["league"]], ignore_index=True)
+    grp = ["league", "season", "team"] if has_league else ["season", "team"]
+    sort_cols = (["league", "season", "team", "date"] if has_league
+                 else ["season", "team", "date"])
+    long = long.sort_values(sort_cols, kind="mergesort")
+    g = long.groupby(grp, sort=False)
+
+    # SoE-weighted form: weighted rolling mean of pts * (opp_elo/1500)
+    long["soe_weight"] = long["opp_elo"] / 1500.0
+    long["weighted_pts"] = long["pts"] * long["soe_weight"]
+    roll_wpts = g["weighted_pts"].transform(lambda s: s.shift(1).rolling(window, min_periods=1).mean())
+    roll_w = g["soe_weight"].transform(lambda s: s.shift(1).rolling(window, min_periods=1).mean())
+    long["form_soe"] = (roll_wpts / roll_w.replace(0, pd.NA)).fillna(0.0)
+
+    # Rolling PPG
+    long["ppg_rolling"] = g["pts"].transform(lambda s: s.shift(1).rolling(window, min_periods=1).mean()).fillna(0.0)
+
+    home = long.set_index(["season", "date", "team"])[["form_soe", "ppg_rolling"]]
+    out = pd.DataFrame(index=df.index)
+    out["home_form_soe"] = [
+        home.loc[(s, d, t), "form_soe"]
+        for s, d, t in zip(df["season"], df["date"], df["home_team"])
+    ]
+    out["away_form_soe"] = [
+        home.loc[(s, d, t), "form_soe"]
+        for s, d, t in zip(df["season"], df["date"], df["away_team"])
+    ]
+    out["ppg_rolling_home"] = [
+        home.loc[(s, d, t), "ppg_rolling"]
+        for s, d, t in zip(df["season"], df["date"], df["home_team"])
+    ]
+    out["ppg_rolling_away"] = [
+        home.loc[(s, d, t), "ppg_rolling"]
+        for s, d, t in zip(df["season"], df["date"], df["away_team"])
+    ]
+    return out
+
+
+def _market_features(df: pd.DataFrame) -> pd.DataFrame:
+    """De-vigged market probabilities from B365 opening odds. Missing -> 1/3."""
+    out = pd.DataFrame(index=df.index)
+    inv_h = 1.0 / df["b365h"]
+    inv_d = 1.0 / df["b365d"]
+    inv_a = 1.0 / df["b365a"]
+    overround = inv_h + inv_d + inv_a
+    out["mkt_prob_home"] = (inv_h / overround).fillna(1.0 / 3.0)
+    out["mkt_prob_draw"] = (inv_d / overround).fillna(1.0 / 3.0)
+    out["mkt_prob_away"] = (inv_a / overround).fillna(1.0 / 3.0)
+    return out
+
+
 def add_features(df: pd.DataFrame, form_window: int = 5) -> pd.DataFrame:
-    """Add temporal, differential, and recent-form features."""
+    """Add temporal, differential, form, xG, Elo, SoE, and market features."""
     df = df.copy()
 
     # --- temporal ---
@@ -293,6 +499,27 @@ def add_features(df: pd.DataFrame, form_window: int = 5) -> pd.DataFrame:
 
     # --- form differential ---
     df["form_pts_diff"] = df["home_form_pts"] - df["away_form_pts"]
+
+    # --- rest / midweek ---
+    rest = _rest_features(df)
+    df = pd.concat([df, rest], axis=1)
+
+    # --- rolling xG & finishing luck ---
+    xg_roll = _xg_rolling_features(df, window=form_window)
+    df = pd.concat([df, xg_roll], axis=1)
+
+    # --- Elo ratings (before SoE, which depends on Elo) ---
+    elo = _elo_ratings(df)
+    df = pd.concat([df, elo], axis=1)
+
+    # --- SoE-weighted form & rolling PPG ---
+    soe = _soe_form_features(df, elo, window=form_window)
+    df = pd.concat([df, soe], axis=1)
+
+    # --- market probabilities ---
+    mkt = _market_features(df)
+    df = pd.concat([df, mkt], axis=1)
+
     return df
 
 

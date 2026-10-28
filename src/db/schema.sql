@@ -25,8 +25,13 @@ CREATE TABLE IF NOT EXISTS matches (
     ht_away_goals   INTEGER,
     shots_home      INTEGER,
     shots_away      INTEGER,
+    shots_on_target_home INTEGER,
+    shots_on_target_away INTEGER,
     xg_home         REAL,
     xg_away         REAL,
+    b365h           REAL,
+    b365d           REAL,
+    b365a           REAL,
     referee         TEXT,
     source          TEXT,                    -- football-data.co.uk | understat
     xg_source       TEXT,                    -- football-data.co.uk | understat

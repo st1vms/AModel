@@ -39,7 +39,7 @@ def test_load_data_shapes_and_targets():
     df, labels, feats = data.load_data()
     assert len(df) == 3879
     assert len(labels) == 34
-    assert len(feats) == 18
+    assert len(feats) == 34
     assert df["outcome"].isin([0, 1, 2]).all()
     # Outcome consistent with goals.
     assert ((df["outcome"] == 0) == (df["home_goals"] > df["away_goals"])).all()

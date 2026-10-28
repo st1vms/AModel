@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pandas as pd
 
 import config
@@ -167,11 +168,21 @@ def build_fixtures(
     fixtures["shots_away"] = fixtures["away_team"].map(priors["away_shots"]).fillna(avgs["shots_away"])
     fixtures["xg_home"] = fixtures["home_team"].map(priors["home_xg"]).fillna(avgs["xg_home"])
     fixtures["xg_away"] = fixtures["away_team"].map(priors["away_xg"]).fillna(avgs["xg_away"])
+    # Unknown at fixture time: shots on target and opening odds. NaN lets
+    # xg_eff fall back to 0 and market probs fall back to 1/3.
+    fixtures["shots_on_target_home"] = float("nan")
+    fixtures["shots_on_target_away"] = float("nan")
+    fixtures["b365h"] = float("nan")
+    fixtures["b365d"] = float("nan")
+    fixtures["b365a"] = float("nan")
     fixtures["_is_fixture"] = True
 
     hist = historical[["league", "season", "date", "home_team", "away_team",
                        "home_goals", "away_goals",
-                       "shots_home", "shots_away", "xg_home", "xg_away"]].copy()
+                       "shots_home", "shots_away",
+                       "shots_on_target_home", "shots_on_target_away",
+                       "xg_home", "xg_away",
+                       "b365h", "b365d", "b365a"]].copy()
     hist["_is_fixture"] = False
     combined = pd.concat([hist, fixtures], ignore_index=True)
     combined = combined.sort_values(["season", "date", "home_team"],
@@ -182,29 +193,41 @@ def build_fixtures(
     # diffs from their own rows.
     combined = add_features(combined)
 
-    # Form fix: fixture rows have NaN goals, which _form_features treats as
-    # 0 points / 0 goals, so each team's own *future scheduled matches*
-    # would pollute the rolling window of later fixtures (form decays to 0
-    # by mid-season and the model falls back to base-rate draws). The form
-    # on *played* rows is already correct — fixture dates are all in the
-    # future, so they cannot enter a played match's strictly-earlier
-    # window — so take each team's latest real-match form and map it onto
-    # all of its fixtures.
+    # Rolling-feature fix: fixture rows have NaN goals, which the rolling
+    # features (_form_features, _xg_rolling_features, _soe_form_features)
+    # treat as 0 points / 0 goals, so each team's own *future scheduled
+    # matches* would pollute the rolling window of later fixtures (form
+    # decays to 0 by mid-season and the model falls back to base-rate
+    # draws). The values on *played* rows are already correct — fixture
+    # dates are all in the future, so they cannot enter a played match's
+    # strictly-earlier window — so take each team's latest real-match
+    # values and map them onto all of its fixtures.
+    #
+    # Per-team rolling features to carry forward (home/away role columns
+    # map onto the same per-team quantity):
+    per_team = {
+        "form_pts": ("home_form_pts", "away_form_pts"),
+        "form_gf": ("home_form_gf", "away_form_gf"),
+        "form_ga": ("home_form_ga", "away_form_ga"),
+        "form_soe": ("home_form_soe", "away_form_soe"),
+        "ppg_rolling": ("ppg_rolling_home", "ppg_rolling_away"),
+        "roll_luck": ("finishing_luck_home", "finishing_luck_away"),
+    }
     real = combined[~combined["_is_fixture"]]
-    home_long = real[["season", "date", "home_team",
-                      "home_form_pts", "home_form_gf", "home_form_ga"]].rename(
-        columns={"home_team": "team", "home_form_pts": "form_pts",
-                 "home_form_gf": "form_gf", "home_form_ga": "form_ga"})
-    away_long = real[["season", "date", "away_team",
-                      "away_form_pts", "away_form_gf", "away_form_ga"]].rename(
-        columns={"away_team": "team", "away_form_pts": "form_pts",
-                 "away_form_gf": "form_gf", "away_form_ga": "form_ga"})
+    long_parts = []
+    for feat, (hcol, acol) in per_team.items():
+        h = real[["season", "date", "home_team", hcol]].rename(
+            columns={"home_team": "team", hcol: feat})
+        a = real[["season", "date", "away_team", acol]].rename(
+            columns={"away_team": "team", acol: feat})
+        long_parts.append(pd.concat([h, a], ignore_index=True))
     latest = (
-        pd.concat([home_long, away_long], ignore_index=True)
+        pd.concat(long_parts, ignore_index=True)
         .sort_values(["season", "team", "date"], kind="mergesort")
         .groupby(["season", "team"], as_index=False)
         .last()
         .drop(columns=["date"])
+        .rename(columns={f: f"_latest_{f}" for f in per_team})
     )
     combined = (
         combined
@@ -213,17 +236,57 @@ def build_fixtures(
         .merge(latest.rename(columns={"team": "away_team"}),
                on=["season", "away_team"], how="left", suffixes=("", "_away"))
     )
-    combined["home_form_pts"] = combined["form_pts"].fillna(0.0)
-    combined["home_form_gf"] = combined["form_gf"].fillna(0.0)
-    combined["home_form_ga"] = combined["form_ga"].fillna(0.0)
-    combined["away_form_pts"] = combined["form_pts_away"].fillna(0.0)
-    combined["away_form_gf"] = combined["form_gf_away"].fillna(0.0)
-    combined["away_form_ga"] = combined["form_ga_away"].fillna(0.0)
+    for feat, (hcol, acol) in per_team.items():
+        combined[hcol] = combined[f"_latest_{feat}"].fillna(0.0)
+        combined[acol] = combined[f"_latest_{feat}_away"].fillna(0.0)
     combined["form_pts_diff"] = combined["home_form_pts"] - combined["away_form_pts"]
+    # xg_diff_rolling is a home-away differential of a per-team rolling xg
+    # gap that is not stored separately, so it cannot be carried forward
+    # per team. Use 0.0 (neutral) for fixtures: the rolling xg gap is a
+    # small-magnitude feature and 0 is a safe neutral prior.
+    combined["xg_diff_rolling"] = 0.0
     combined = combined.drop(columns=[
-        "form_pts", "form_gf", "form_ga",
-        "form_pts_away", "form_gf_away", "form_ga_away",
-    ])
+        f"_latest_{f}" for f in per_team
+    ] + [f"_latest_{f}_away" for f in per_team])
+
+    # Rest days: for a fixture, the true rest is the gap since the team's
+    # last *played* match (fixture rows have no goals, so the date-diff
+    # computed on the combined frame would measure gap-to-previous-fixture
+    # for a team's second+ fixture). Recompute from the last real date.
+    last_real = pd.concat([
+        real[["season", "date", "home_team"]].rename(columns={"home_team": "team"}),
+        real[["season", "date", "away_team"]].rename(columns={"away_team": "team"}),
+    ], ignore_index=True)
+    last_real = (
+        last_real
+        .sort_values(["season", "team", "date"], kind="mergesort")
+        .groupby(["season", "team"], as_index=False)
+        .last()
+        .rename(columns={"date": "last_date"})
+    )
+    fx = combined[combined["_is_fixture"]]
+    rest_h = fx.merge(
+        last_real.rename(columns={"team": "home_team"}),
+        on=["season", "home_team"], how="left",
+    )
+    rest_a = fx.merge(
+        last_real.rename(columns={"team": "away_team"}),
+        on=["season", "away_team"], how="left",
+    )
+    # rest_h/rest_a carry a fresh RangeIndex; align positionally with fx.
+    combined.loc[fx.index, "rest_days_home"] = (
+        (fx["date"].to_numpy() - pd.to_datetime(rest_h["last_date"]).to_numpy())
+        / np.timedelta64(1, "D")
+    )
+    combined.loc[fx.index, "rest_days_away"] = (
+        (fx["date"].to_numpy() - pd.to_datetime(rest_a["last_date"]).to_numpy())
+        / np.timedelta64(1, "D")
+    )
+    combined["rest_days_home"] = combined["rest_days_home"].fillna(7.0)
+    combined["rest_days_away"] = combined["rest_days_away"].fillna(7.0)
+    combined["is_midweek"] = (
+        (combined["rest_days_home"] <= 4) | (combined["rest_days_away"] <= 4)
+    ).astype(int)
 
     out = combined[combined["_is_fixture"]].drop(columns=["_is_fixture"])
 

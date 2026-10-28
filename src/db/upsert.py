@@ -18,8 +18,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
     migrated DBs.
     """
     cols = [r[1] for r in conn.execute("PRAGMA table_info(teams)").fetchall()]
-    if not cols or "league" in cols:
-        return  # no teams table yet (schema.sql creates it) or already migrated
+    if not cols:
+        return  # no teams table yet (schema.sql creates it)
+
+    # --- add new columns to matches if missing (idempotent) ---
+    match_cols = [r[1] for r in conn.execute("PRAGMA table_info(matches)").fetchall()]
+    if match_cols:  # matches table exists
+        new_match_cols = {
+            "shots_on_target_home": "INTEGER",
+            "shots_on_target_away": "INTEGER",
+            "b365h": "REAL",
+            "b365d": "REAL",
+            "b365a": "REAL",
+        }
+        for col, col_type in new_match_cols.items():
+            if col not in match_cols:
+                conn.execute(f"ALTER TABLE matches ADD COLUMN {col} {col_type}")
+
+    if "league" in cols:
+        return  # already migrated to multi-league
 
     conn.execute("PRAGMA foreign_keys = OFF")
     conn.execute("BEGIN")
@@ -59,8 +76,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 ht_away_goals   INTEGER,
                 shots_home      INTEGER,
                 shots_away      INTEGER,
+                shots_on_target_home INTEGER,
+                shots_on_target_away INTEGER,
                 xg_home         REAL,
                 xg_away         REAL,
+                b365h           REAL,
+                b365d           REAL,
+                b365a           REAL,
                 referee         TEXT,
                 source          TEXT,
                 xg_source       TEXT,
@@ -74,13 +96,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
             INSERT INTO matches_new (
                 match_id, league, season, date, home_team_id, away_team_id,
                 home_goals, away_goals, ht_home_goals, ht_away_goals,
-                shots_home, shots_away, xg_home, xg_away,
+                shots_home, shots_away,
+                shots_on_target_home, shots_on_target_away,
+                xg_home, xg_away, b365h, b365d, b365a,
                 referee, source, xg_source, flag
             )
             SELECT
                 match_id, 'serie_a', season, date, home_team_id, away_team_id,
                 home_goals, away_goals, ht_home_goals, ht_away_goals,
-                shots_home, shots_away, xg_home, xg_away,
+                shots_home, shots_away,
+                shots_on_target_home, shots_on_target_away,
+                xg_home, xg_away, b365h, b365d, b365a,
                 referee, source, xg_source, flag
             FROM matches
             """
@@ -168,8 +194,13 @@ def load(league: str = config.DEFAULT_LEAGUE) -> int:
             r.ht_away_goals,
             r.shots_home,
             r.shots_away,
+            r.shots_on_target_home,
+            r.shots_on_target_away,
             r.xg_home,
             r.xg_away,
+            r.b365h,
+            r.b365d,
+            r.b365a,
             r.referee,
             r.source,
             r.xg_source,
@@ -183,9 +214,11 @@ def load(league: str = config.DEFAULT_LEAGUE) -> int:
         INSERT INTO matches (
             league, season, date, home_team_id, away_team_id,
             home_goals, away_goals, ht_home_goals, ht_away_goals,
-            shots_home, shots_away, xg_home, xg_away,
+            shots_home, shots_away,
+            shots_on_target_home, shots_on_target_away,
+            xg_home, xg_away, b365h, b365d, b365a,
             referee, source, xg_source, flag
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(season, league, date, home_team_id, away_team_id) DO UPDATE SET
             home_goals = excluded.home_goals,
             away_goals = excluded.away_goals,
@@ -193,8 +226,13 @@ def load(league: str = config.DEFAULT_LEAGUE) -> int:
             ht_away_goals = excluded.ht_away_goals,
             shots_home = excluded.shots_home,
             shots_away = excluded.shots_away,
+            shots_on_target_home = excluded.shots_on_target_home,
+            shots_on_target_away = excluded.shots_on_target_away,
             xg_home = excluded.xg_home,
             xg_away = excluded.xg_away,
+            b365h = excluded.b365h,
+            b365d = excluded.b365d,
+            b365a = excluded.b365a,
             referee = excluded.referee,
             source = excluded.source,
             xg_source = excluded.xg_source,

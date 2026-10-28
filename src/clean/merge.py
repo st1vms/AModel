@@ -119,8 +119,9 @@ def merge(league: str = config.DEFAULT_LEAGUE) -> pd.DataFrame:
     """Merge both sources for a league into a unified match DataFrame.
 
     Columns: league, season, date, home_team, away_team, home_goals, away_goals,
-    ht_home_goals, ht_away_goals, shots_home, shots_away, xg_home, xg_away,
-    referee, source, xg_source, flag
+    ht_home_goals, ht_away_goals, shots_home, shots_away,
+    shots_on_target_home, shots_on_target_away, xg_home, xg_away,
+    b365h, b365d, b365a, referee, source, xg_source, flag
     """
     fd = load_football_data(league)
     us = load_understat(league)
@@ -155,8 +156,13 @@ def merge(league: str = config.DEFAULT_LEAGUE) -> pd.DataFrame:
                 "ht_away_goals": to_int_or_none(r.get("HTAG")),
                 "shots_home": to_int_or_none(r.get("HS")),
                 "shots_away": to_int_or_none(r.get("AS")),
+                "shots_on_target_home": to_int_or_none(r.get("HST")),
+                "shots_on_target_away": to_int_or_none(r.get("AST")),
                 "xg_home": to_float_or_none(r.get("HxG")),
                 "xg_away": to_float_or_none(r.get("AxG")),
+                "b365h": to_float_or_none(r.get("B365H")),
+                "b365d": to_float_or_none(r.get("B365D")),
+                "b365a": to_float_or_none(r.get("B365A")),
                 "referee": (str(r.get("Referee")).strip() if pd.notna(r.get("Referee")) else None),
                 "source": "football-data.co.uk",
                 "xg_source": "football-data.co.uk" if has_xg else None,
@@ -202,8 +208,13 @@ def merge(league: str = config.DEFAULT_LEAGUE) -> pd.DataFrame:
                     "ht_away_goals": None,
                     "shots_home": to_int_or_none(r["shots_home"]),
                     "shots_away": to_int_or_none(r["shots_away"]),
+                    "shots_on_target_home": None,
+                    "shots_on_target_away": None,
                     "xg_home": to_float_or_none(r["xg_home"]),
                     "xg_away": to_float_or_none(r["xg_away"]),
+                    "b365h": None,
+                    "b365d": None,
+                    "b365a": None,
                     "referee": None,
                     "source": "understat",
                     "xg_source": "understat" if to_float_or_none(r["xg_home"]) is not None else None,
