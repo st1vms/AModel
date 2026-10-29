@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS matches (
     b365h           REAL,
     b365d           REAL,
     b365a           REAL,
+    b365ch          REAL,                    -- Bet365 closing (2019-20+ only)
+    b365cd          REAL,
+    b365ca          REAL,
     referee         TEXT,
     source          TEXT,                    -- football-data.co.uk | understat
     xg_source       TEXT,                    -- football-data.co.uk | understat

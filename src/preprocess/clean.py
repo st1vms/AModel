@@ -68,6 +68,7 @@ def load_matches(source: str | Path | None = None, league: str | None = None) ->
                        m.shots_on_target_home, m.shots_on_target_away,
                        m.xg_home, m.xg_away,
                        m.b365h, m.b365d, m.b365a,
+                       m.b365ch, m.b365cd, m.b365ca,
                        m.referee, m.source, m.xg_source, m.flag
                 FROM matches m
                 JOIN teams t1 ON m.home_team_id = t1.team_id
@@ -142,6 +143,7 @@ def clean(
         "shots_on_target_home", "shots_on_target_away",
         "xg_home", "xg_away",
         "b365h", "b365d", "b365a",
+        "b365ch", "b365cd", "b365ca",
     ]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")

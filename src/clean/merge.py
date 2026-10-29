@@ -121,7 +121,10 @@ def merge(league: str = config.DEFAULT_LEAGUE) -> pd.DataFrame:
     Columns: league, season, date, home_team, away_team, home_goals, away_goals,
     ht_home_goals, ht_away_goals, shots_home, shots_away,
     shots_on_target_home, shots_on_target_away, xg_home, xg_away,
-    b365h, b365d, b365a, referee, source, xg_source, flag
+    b365h, b365d, b365a, b365ch, b365cd, b365ca, referee, source, xg_source, flag
+
+    Closing odds (b365ch/b365cd/b365ca) are only published by football-data
+    from 2019-20 onward; earlier seasons carry None.
     """
     fd = load_football_data(league)
     us = load_understat(league)
@@ -163,6 +166,9 @@ def merge(league: str = config.DEFAULT_LEAGUE) -> pd.DataFrame:
                 "b365h": to_float_or_none(r.get("B365H")),
                 "b365d": to_float_or_none(r.get("B365D")),
                 "b365a": to_float_or_none(r.get("B365A")),
+                "b365ch": to_float_or_none(r.get("B365CH")),
+                "b365cd": to_float_or_none(r.get("B365CD")),
+                "b365ca": to_float_or_none(r.get("B365CA")),
                 "referee": (str(r.get("Referee")).strip() if pd.notna(r.get("Referee")) else None),
                 "source": "football-data.co.uk",
                 "xg_source": "football-data.co.uk" if has_xg else None,
@@ -215,6 +221,9 @@ def merge(league: str = config.DEFAULT_LEAGUE) -> pd.DataFrame:
                     "b365h": None,
                     "b365d": None,
                     "b365a": None,
+                    "b365ch": None,
+                    "b365cd": None,
+                    "b365ca": None,
                     "referee": None,
                     "source": "understat",
                     "xg_source": "understat" if to_float_or_none(r["xg_home"]) is not None else None,

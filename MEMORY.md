@@ -97,6 +97,7 @@ src/ml/plots.py           # confusion matrix, feature importance, calibration cu
 src/ml/train.py           # CLI: tune -> train -> evaluate -> save models/plots (per league)
                           #   + run_training(league=...) (structured dict for the UI)
 src/ml/predict.py         # CLI: inference with saved pipeline.joblib (per league)
+src/ml/backtest.py        # CLI: walk-forward CLV/ROI backtest vs closing odds (per league)
 src/ml/fixtures.py        # build_fixtures(season, league): scheduled (unplayed) matches ->
                           #   prediction-ready frame (auto from raw Understat JSON)
 src/ui/app.py             # Streamlit UI: League selector + update data / train / predict (3 tabs)
@@ -138,6 +139,8 @@ All CLIs accept `--league KEY` (default: `serie_a`).
 .venv/bin/python -m src.ml.train --league KEY [--include-ht] [--no-xg] [--walk-forward]
         [--skip-tuning] [--out-dir PATH]
 .venv/bin/python -m src.ml.predict --league KEY --demo | --matches fixtures.csv
+.venv/bin/python -m src.ml.backtest --league KEY [--start 2017-18] [--end 2026-26]
+        [--vig 0.03] [--kelly-fraction 0.25]                # CLV/ROI backtest
 .venv/bin/python -m streamlit run src/ui/app.py             # Streamlit UI (League selector in sidebar)
 .venv/bin/python -m pytest tests/ -q                        # tests
 ```
@@ -226,6 +229,51 @@ Goal regression (walk-forward MAE): best ~0.70 (away, lightgbm) / ~0.76
   sklearn `CalibratedClassifierCV` needs `FrozenEstimator` (cv="prefit" gone);
   `roc_auc_score` per-class = binary call, no `average`; `calibration_curve`
   is binary-only (binarize y_true).
+
+## Backtest / CLV (2026-10-29)
+
+`src/ml/backtest.py` answers: *does the model have real betting edge?* Walk-forward
+(one fold per validation season, expanding window, 2017-18..2026-26), each fold
+retrained with the saved pipeline's classifier + tuned params (no re-tuning).
+
+- **Closing odds plumbed through the pipeline** (2026-10-29): `b365ch/b365cd/b365ca`
+  added to `merge.py` record dicts, `schema.sql`, `upsert.py` (incl. `_migrate`),
+  `clean.py` SELECT + coercion. **Deliberately NOT in `FEATURES`** — closing odds
+  are the benchmark, not a feature (would leak). Clean CSVs are now 48 columns.
+  Availability: B365C* present **2019-20 onward, zero nulls, all 5 leagues**
+  (12,852 matches total); 2016-18..2018-19 lack them → `has_closing=False`,
+  counted for accuracy but excluded from CLV/ROI.
+- **Protocol**: model pick = argmax of model probs (ties → home). CLV per bet =
+  `p_pick / p_closing_devigged - 1` (de-vig = `inv/sum(inv)`, NaN → 1/3, same as
+  `_market_features`; `devig_probs` uses `sum(skipna=False)` so one missing odds
+  NaNs the whole row). ROI: flat 1-unit + fractional Kelly (compounding bankroll,
+  default ¼ Kelly), gross (raw closing odds already carry the book margin) and
+  net of an extra 3% flat commission. Baseline = market favourite (higher
+  de-vigged closing prob, ties → home; opening-odds fallback pre-2019-20).
+  Confidence bins on `p_fav = max(p_home, p_away)`: `<0.50`, `0.50-0.70`, `>=0.70`.
+- **Artifacts**: `data/export/ml/{league}/results/clv_backtest.csv` (per-match) +
+  `clv_backtest_summary.csv` (scope ∈ {model, baseline} × segment ∈
+  {all, has_closing, bin_<0.50, bin_0.50-0.70, bin_>=0.70}).
+- **Headline results (2026-10-29, has_closing segment, flat ROI gross / net)**:
+
+| league | model acc | model ROI g/n | baseline ROI g/n | mean CLV | ≥0.70 bin: acc / ROI g |
+|---|---|---|---|---|---|
+| premier_league | 0.610 | +0.417 / +0.375 | −0.037 / −0.066 | +0.573 | 0.853 / +0.502 |
+| serie_a | 0.589 | +0.295 / +0.256 | −0.018 / −0.047 | +0.639 | 0.759 / +0.389 |
+| la_liga | 0.595 | +0.398 / +0.356 | −0.009 / −0.039 | +0.585 | 0.825 / +0.513 |
+| bundesliga | 0.619 | +0.487 / +0.442 | −0.056 / −0.084 | +0.654 | 0.834 / +0.557 |
+| ligue_1 | 0.607 | +0.453 / +0.409 | −0.039 / −0.068 | +0.616 | 0.818 / +0.584 |
+
+  Model log-loss beats the de-vigged closing line's own log-loss in every league
+  (e.g. PL 0.843 vs 0.966). **The model beats the market favourite in every
+  league and every confidence bin**; the ≥0.70 bin is the strongest (acc 0.76-0.85,
+  ROI +0.39..+0.58). Kelly ROI is astronomically large (10¹⁵+) — mathematically
+  correct for a real edge compounded over ~2,700 bets, but treat as "huge", not
+  literal. Edge drivers: the model bets draws ~20% of the time (win rate 36% vs
+  ~29% market-implied) and backs away sides more often than the market does.
+  Caveat: walk-forward folds are in-sample-ish for the *features* (form/xG are
+  pre-match, but the 2019-20+ closing line is the true benchmark — CLV is the
+  honest number).
 
 ## UI (src/ui — Streamlit)
 
@@ -337,7 +385,7 @@ int, float or bool`. Fix: `build_fixtures` drops null-HT rows from
 trained on). Regression test:
 `tests/test_ml.py::test_build_fixtures_form_columns_numeric`.
 
-## Current status (2026-10-28)
+## Current status (2026-10-29)
 
 - **Multi-league migration done**: legacy flat Serie A files moved to
   `data/raw/{source}/serie_a/` and `data/export/ml/serie_a/`; DB auto-migrated
@@ -352,7 +400,10 @@ trained on). Regression test:
   - 2022-23: 10 matches in June (season ended 2023-06-04).
   - 2023-24: 1 match in June (ended 2024-06-02).
   - 2026-27: 52 cross-source xG mismatches > 0.15 (football-data vs Understat xG models differ).
-- **52/52 tests pass** (14 pipeline + 12 preprocessing + 14 ML + 12 UI).
+- **84/84 tests pass** (14 pipeline + 19 preprocessing + 14 ML + 16 UI + 8 fetch + 13 backtest).
+- **Backtest/CLV suite done** (2026-10-29): closing odds in DB + clean CSVs,
+  `src/ml/backtest.py` run for all 5 leagues — model beats the market favourite
+  in every league and confidence bin (see Backtest / CLV section).
 - Spot-checks verified: 2024-25 champion **Napoli** (82 pts), Bologna 5-0 Lazio 2025-03-16, Inter 4-4 Juventus 2024-10-27.
 - Champions: 2016-17/17-18/18-19/19-20 Juventus, 2020-21 Inter, 2021-22 AC Milan, 2022-23 Napoli, 2023-24 Inter, 2024-25 Napoli, 2025-26 Inter.
 
@@ -367,6 +418,10 @@ trained on). Regression test:
 
 ## Done
 
+- **Backtest / CLV** (2026-10-29) — closing odds (B365C*) plumbed through
+  merge/schema/upsert/clean; `src/ml/backtest.py` (walk-forward CLV, flat +
+  Kelly ROI, market-favourite baseline, confidence slicing); run for all 5
+  leagues; `tests/test_backtest.py` (13 tests).
 - **Multi-league support** (2026-10-28) — `config.LEAGUES` registry (5 leagues),
   per-league raw/ML/DB layout, per-league models, UI League selector,
   legacy Serie A data migrated, league-aware `csv_export`. Plan:

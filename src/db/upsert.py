@@ -30,6 +30,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "b365h": "REAL",
             "b365d": "REAL",
             "b365a": "REAL",
+            "b365ch": "REAL",
+            "b365cd": "REAL",
+            "b365ca": "REAL",
         }
         for col, col_type in new_match_cols.items():
             if col not in match_cols:
@@ -83,6 +86,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 b365h           REAL,
                 b365d           REAL,
                 b365a           REAL,
+                b365ch          REAL,
+                b365cd          REAL,
+                b365ca          REAL,
                 referee         TEXT,
                 source          TEXT,
                 xg_source       TEXT,
@@ -98,7 +104,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 home_goals, away_goals, ht_home_goals, ht_away_goals,
                 shots_home, shots_away,
                 shots_on_target_home, shots_on_target_away,
-                xg_home, xg_away, b365h, b365d, b365a,
+                xg_home, xg_away, b365h, b365d, b365a, b365ch, b365cd, b365ca,
                 referee, source, xg_source, flag
             )
             SELECT
@@ -106,7 +112,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 home_goals, away_goals, ht_home_goals, ht_away_goals,
                 shots_home, shots_away,
                 shots_on_target_home, shots_on_target_away,
-                xg_home, xg_away, b365h, b365d, b365a,
+                xg_home, xg_away, b365h, b365d, b365a, b365ch, b365cd, b365ca,
                 referee, source, xg_source, flag
             FROM matches
             """
@@ -201,6 +207,9 @@ def load(league: str = config.DEFAULT_LEAGUE) -> int:
             r.b365h,
             r.b365d,
             r.b365a,
+            r.b365ch,
+            r.b365cd,
+            r.b365ca,
             r.referee,
             r.source,
             r.xg_source,
@@ -216,9 +225,9 @@ def load(league: str = config.DEFAULT_LEAGUE) -> int:
             home_goals, away_goals, ht_home_goals, ht_away_goals,
             shots_home, shots_away,
             shots_on_target_home, shots_on_target_away,
-            xg_home, xg_away, b365h, b365d, b365a,
+            xg_home, xg_away, b365h, b365d, b365a, b365ch, b365cd, b365ca,
             referee, source, xg_source, flag
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(season, league, date, home_team_id, away_team_id) DO UPDATE SET
             home_goals = excluded.home_goals,
             away_goals = excluded.away_goals,
@@ -233,6 +242,9 @@ def load(league: str = config.DEFAULT_LEAGUE) -> int:
             b365h = excluded.b365h,
             b365d = excluded.b365d,
             b365a = excluded.b365a,
+            b365ch = excluded.b365ch,
+            b365cd = excluded.b365cd,
+            b365ca = excluded.b365ca,
             referee = excluded.referee,
             source = excluded.source,
             xg_source = excluded.xg_source,
