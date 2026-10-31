@@ -253,7 +253,18 @@ retrained with the saved pipeline's classifier + tuned params (no re-tuning).
   Confidence bins on `p_fav = max(p_home, p_away)`: `<0.50`, `0.50-0.70`, `>=0.70`.
 - **Artifacts**: `data/export/ml/{league}/results/clv_backtest.csv` (per-match) +
   `clv_backtest_summary.csv` (scope ∈ {model, baseline} × segment ∈
-  {all, has_closing, bin_<0.50, bin_0.50-0.70, bin_>=0.70}).
+  {all, has_closing, bin_<0.50, bin_0.50-0.70, bin_>=0.70, odds_1.00-1.50, odds_1.50-1.90, odds_1.90-2.50, odds_>2.50, odds_>1.90}) +
+  `clv_odds_summary.csv` (bracket breakdown) + `clv_odds_summary.md` (Reddit/README markdown summary table).
+- **Odds stratification (2026-10-31)**:
+  - Added decimal odds binning logic (`assign_odds_bracket`, `MUTUAL_ODDS_BINS`, `ODDS_BINS`: `1.00-1.50`, `1.50-1.90`, `1.90-2.50`, `>2.50`, `>1.90`).
+  - Added `odds_bracket` and `odds_bin` columns to `build_betting_frame`.
+  - Added `build_odds_summary` and `format_odds_summary_markdown` in `src/ml/backtest.py` with export helper `export_odds_summary_markdown` in `src/export/backtest_report.py`.
+  - Headline Serie A odds results (2,740 matches with closing odds):
+    - `1.00 - 1.50`: 507 bets, Acc 78.9% (Base 78.9%), Model ROI gross +4.5% / net +1.4%, Mean CLV +14.4%.
+    - `1.50 - 1.90`: 617 bets, Acc 69.0% (Base 69.0%), Model ROI gross +14.7% / net +11.2%, Mean CLV +29.7%.
+    - `1.90 - 2.50`: 544 bets, Acc 61.2% (Base 61.2%), Model ROI gross +31.4% / net +27.4%, Mean CLV +53.2%.
+    - `> 2.50`: 1,072 bets, Acc 42.4% (Base 32.2%), Model ROI gross +48.9% / net +44.4% vs Baseline -31.0%, Mean CLV +112.3%.
+    - **`> 1.90 (High-Value)`**: 1,616 bets, Acc 48.7% (Base 42.0%), Model ROI gross +43.0% / net +38.7% vs Baseline -10.0%, Mean CLV +92.4%.
 - **Headline results (2026-10-29, has_closing segment, flat ROI gross / net)**:
 
 | league | model acc | model ROI g/n | baseline ROI g/n | mean CLV | ≥0.70 bin: acc / ROI g |
@@ -400,10 +411,10 @@ trained on). Regression test:
   - 2022-23: 10 matches in June (season ended 2023-06-04).
   - 2023-24: 1 match in June (ended 2024-06-02).
   - 2026-27: 52 cross-source xG mismatches > 0.15 (football-data vs Understat xG models differ).
-- **84/84 tests pass** (14 pipeline + 19 preprocessing + 14 ML + 16 UI + 8 fetch + 13 backtest).
-- **Backtest/CLV suite done** (2026-10-29): closing odds in DB + clean CSVs,
-  `src/ml/backtest.py` run for all 5 leagues — model beats the market favourite
-  in every league and confidence bin (see Backtest / CLV section).
+- **89/89 tests pass** (14 pipeline + 19 preprocessing + 14 ML + 16 UI + 8 fetch + 18 backtest).
+- **Backtest/CLV suite done** (2026-10-29, updated 2026-10-31): closing odds in DB + clean CSVs,
+  `src/ml/backtest.py` run for all 5 leagues, odds stratification breakdown + Markdown report generation added,
+  `tests/test_backtest.py` (18 tests).
 - Spot-checks verified: 2024-25 champion **Napoli** (82 pts), Bologna 5-0 Lazio 2025-03-16, Inter 4-4 Juventus 2024-10-27.
 - Champions: 2016-17/17-18/18-19/19-20 Juventus, 2020-21 Inter, 2021-22 AC Milan, 2022-23 Napoli, 2023-24 Inter, 2024-25 Napoli, 2025-26 Inter.
 
@@ -418,10 +429,10 @@ trained on). Regression test:
 
 ## Done
 
-- **Backtest / CLV** (2026-10-29) — closing odds (B365C*) plumbed through
+- **Backtest / CLV & Odds Stratification** (2026-10-29, updated 2026-10-31) — closing odds (B365C*) plumbed through
   merge/schema/upsert/clean; `src/ml/backtest.py` (walk-forward CLV, flat +
-  Kelly ROI, market-favourite baseline, confidence slicing); run for all 5
-  leagues; `tests/test_backtest.py` (13 tests).
+  Kelly ROI, market-favourite baseline, confidence slicing, decimal odds stratification);
+  Markdown reporting and README documentation added; `tests/test_backtest.py` (18 tests).
 - **Multi-league support** (2026-10-28) — `config.LEAGUES` registry (5 leagues),
   per-league raw/ML/DB layout, per-league models, UI League selector,
   legacy Serie A data migrated, league-aware `csv_export`. Plan:

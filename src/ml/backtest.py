@@ -100,6 +100,8 @@ def roi_flat(wins: pd.Series, odds: pd.Series, vig: float = 0.0) -> float:
     Win: ``odds * (1 - vig) - 1``; loss: ``-1``. Returns mean profit per unit
     staked (ROI). ``vig`` is an *extra* flat commission on top of the odds.
     """
+    if len(wins) == 0:
+        return float("nan")
     profit = np.where(wins.to_numpy(), odds.to_numpy() * (1.0 - vig) - 1.0, -1.0)
     return float(profit.mean())
 
@@ -116,6 +118,8 @@ def roi_kelly(
     Per-bet Kelly fraction ``f = (p*odds - 1) / (odds - 1)`` (clipped at 0),
     scaled by ``fraction``. Returns bankroll growth (ROI).
     """
+    if len(wins) == 0:
+        return float("nan")
     o = odds.to_numpy()
     f = np.where(o > 1.0, (p.to_numpy() * o - 1.0) / np.maximum(o - 1.0, 1e-9), 0.0)
     f = np.clip(f, 0.0, None) * fraction
@@ -196,6 +200,40 @@ CONFIDENCE_BINS = [
     (">=0.70", lambda p: p >= 0.70),
 ]
 
+MUTUAL_ODDS_BINS: list[tuple[str, Any]] = [
+    ("1.00-1.50", lambda o: (o >= 1.0) & (o < 1.50)),
+    ("1.50-1.90", lambda o: (o >= 1.50) & (o < 1.90)),
+    ("1.90-2.50", lambda o: (o >= 1.90) & (o <= 2.50)),
+    (">2.50", lambda o: o > 2.50),
+]
+
+ODDS_BINS: list[tuple[str, Any]] = MUTUAL_ODDS_BINS + [
+    (">1.90", lambda o: o >= 1.90),
+]
+
+
+def assign_odds_bracket(
+    odds: pd.Series | float | int | None,
+) -> pd.Series | str | None:
+    """Assign decimal odds to a mutual bracket string:
+    '1.00-1.50', '1.50-1.90', '1.90-2.50', '>2.50' (or NaN/None if missing/invalid).
+    """
+    if isinstance(odds, pd.Series):
+        res = pd.Series(index=odds.index, dtype=object)
+        for name, fn in MUTUAL_ODDS_BINS:
+            # Drop NaN/invalids before indexing
+            valid = odds.notna()
+            mask = valid & fn(odds)
+            res.loc[mask] = name
+        return res
+    if odds is None or pd.isna(odds):
+        return None
+    val = float(odds)
+    for name, fn in MUTUAL_ODDS_BINS:
+        if fn(val):
+            return name
+    return None
+
 
 def _pick_and_odds(probs: pd.DataFrame, odds: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     """argmax pick (ties -> home) and the decimal odds of the picked outcome."""
@@ -251,6 +289,8 @@ def build_betting_frame(preds: pd.DataFrame) -> pd.DataFrame:
     df["pick_odds_closing"] = closing_odds.to_numpy()[
         np.arange(len(df)), df["pick"].to_numpy()
     ]
+    df["odds_bracket"] = assign_odds_bracket(df["pick_odds_closing"])
+    df["odds_bin"] = df["odds_bracket"]
     df["win"] = df["pick"] == df["outcome"]
 
     # --- baseline: market favourite (closing; opening fallback pre-2019-20) ---
@@ -329,13 +369,18 @@ def _segment_metrics(
 def build_summary(
     df: pd.DataFrame, vig: float, kelly_fraction: float
 ) -> pd.DataFrame:
-    """One row per (scope, segment): all / has_closing / confidence bins."""
+    """One row per (scope, segment): all / has_closing / confidence bins / odds bins."""
     segments: list[tuple[str, pd.DataFrame]] = [
         ("all", df),
         ("has_closing", df[df["has_closing"]]),
     ]
     for name, fn in CONFIDENCE_BINS:
         segments.append((f"bin_{name}", df[fn(df["p_fav"])]))
+
+    for name, fn in ODDS_BINS:
+        segments.append(
+            (f"odds_{name}", df[df["has_closing"] & fn(df["pick_odds_closing"])])
+        )
 
     rows = []
     for scope in ("model", "baseline"):
@@ -344,6 +389,143 @@ def build_summary(
             row["segment"] = seg_name
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+def build_odds_summary(
+    df: pd.DataFrame, vig: float = 0.03, kelly_fraction: float = 0.25
+) -> pd.DataFrame:
+    """Stratified backtest summary table by odds bracket comparing model vs baseline."""
+    closing_df = df[df["has_closing"]].copy()
+
+    brackets = [
+        ("1.00-1.50", lambda o: (o >= 1.0) & (o < 1.50)),
+        ("1.50-1.90", lambda o: (o >= 1.50) & (o < 1.90)),
+        ("1.90-2.50", lambda o: (o >= 1.90) & (o <= 2.50)),
+        (">2.50", lambda o: o > 2.50),
+        (">1.90", lambda o: o >= 1.90),
+        ("All", lambda o: pd.Series(True, index=o.index)),
+    ]
+
+    rows = []
+    for name, fn in brackets:
+        seg = closing_df[fn(closing_df["pick_odds_closing"])]
+        n = len(seg)
+        if n > 0:
+            m_win = seg["win"]
+            m_odds = seg["pick_odds_closing"]
+            m_acc = float((seg["pick"] == seg["outcome"]).mean())
+            m_roi_gross = roi_flat(m_win, m_odds, vig=0.0)
+            m_roi_net = roi_flat(m_win, m_odds, vig=vig)
+
+            b_win = seg["base_win"]
+            b_odds = seg["base_odds"]
+            b_acc = float((seg["base_pick"] == seg["outcome"]).mean())
+            b_roi_gross = roi_flat(b_win, b_odds, vig=0.0)
+            b_roi_net = roi_flat(b_win, b_odds, vig=vig)
+
+            clv = seg["clv_pick"].dropna()
+            mean_clv = float(clv.mean()) if len(clv) else np.nan
+            median_clv = float(clv.median()) if len(clv) else np.nan
+        else:
+            m_acc = np.nan
+            b_acc = np.nan
+            m_roi_gross = np.nan
+            m_roi_net = np.nan
+            b_roi_gross = np.nan
+            b_roi_net = np.nan
+            mean_clv = np.nan
+            median_clv = np.nan
+
+        rows.append(
+            {
+                "bracket": name,
+                "n_bets": int(n),
+                "model_accuracy": m_acc,
+                "base_accuracy": b_acc,
+                "model_roi_gross": m_roi_gross,
+                "model_roi_net": m_roi_net,
+                "base_roi_gross": b_roi_gross,
+                "base_roi_net": b_roi_net,
+                "mean_clv": mean_clv,
+                "median_clv": median_clv,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def format_odds_summary_markdown(
+    summary: pd.DataFrame,
+    league: str | None = None,
+) -> str:
+    """Format odds summary DataFrame into a clean Markdown table with high-value highlight."""
+    def _fmt_pct(v: float, signed: bool = False) -> str:
+        if pd.isna(v):
+            return "N/A"
+        pct = v * 100.0
+        prefix = "+" if signed and pct > 0 else ""
+        return f"{prefix}{pct:.1f}%"
+
+    def _fmt_bracket_label(b: str) -> str:
+        mapping = {
+            "1.00-1.50": "1.00 - 1.50",
+            "1.50-1.90": "1.50 - 1.90",
+            "1.90-2.50": "1.90 - 2.50",
+            ">2.50": "> 2.50",
+            ">1.90": "> 1.90 (High-Value)",
+            "All": "All Matches",
+        }
+        return mapping.get(b, b)
+
+    lines = []
+    if league:
+        title = league.replace("_", " ").title()
+        lines.append(f"### Backtest Odds Stratification Summary ({title})\n")
+    else:
+        lines.append("### Backtest Odds Stratification Summary\n")
+
+    lines.append("| Odds Bracket | Bets (N) | Model Acc | Baseline Acc | Model ROI (Gross) | Model ROI (Net) | Baseline ROI | Mean CLV |")
+    lines.append("|:---|---:|---:|---:|---:|---:|---:|---:|")
+
+    high_val_row = None
+    for _, r in summary.iterrows():
+        b = str(r["bracket"])
+        label = _fmt_bracket_label(b)
+        n = f"{int(r['n_bets']):,}"
+        m_acc = _fmt_pct(r["model_accuracy"])
+        b_acc = _fmt_pct(r["base_accuracy"])
+        m_gross = _fmt_pct(r["model_roi_gross"], signed=True)
+        m_net = _fmt_pct(r["model_roi_net"], signed=True)
+        b_gross = _fmt_pct(r["base_roi_gross"], signed=True)
+        clv = _fmt_pct(r["mean_clv"], signed=True)
+
+        if b == ">1.90":
+            high_val_row = r
+            lines.append(
+                f"| **{label}** | **{n}** | **{m_acc}** | **{b_acc}** | **{m_gross}** | **{m_net}** | **{b_gross}** | **{clv}** |"
+            )
+        elif b == "All":
+            lines.append(
+                f"| *{label}* | *{n}* | *{m_acc}* | *{b_acc}* | *{m_gross}* | *{m_net}* | *{b_gross}* | *{clv}* |"
+            )
+        else:
+            lines.append(
+                f"| {label} | {n} | {m_acc} | {b_acc} | {m_gross} | {m_net} | {b_gross} | {clv} |"
+            )
+
+    if high_val_row is not None and int(high_val_row["n_bets"]) > 0:
+        hv_n = f"{int(high_val_row['n_bets']):,}"
+        hv_acc = _fmt_pct(high_val_row["model_accuracy"])
+        hv_gross = _fmt_pct(high_val_row["model_roi_gross"], signed=True)
+        hv_net = _fmt_pct(high_val_row["model_roi_net"], signed=True)
+        hv_base_gross = _fmt_pct(high_val_row["base_roi_gross"], signed=True)
+        hv_clv = _fmt_pct(high_val_row["mean_clv"], signed=True)
+        lines.append("\n> **High-Value Bracket Highlights (> 1.90):**")
+        lines.append(f"> - **Selections**: {hv_n} bets placed at odds ≥ 1.90.")
+        lines.append(f"> - **Model Win Rate**: {hv_acc} vs baseline {hv_base_gross} ROI.")
+        lines.append(f"> - **ROI**: {hv_gross} flat gross ({hv_net} net of 3% flat commission).")
+        lines.append(f"> - **Closing Line Value (CLV)**: {hv_clv} mean edge vs de-vigged closing odds.")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -374,24 +556,38 @@ def run_backtest(
     preds = generate_predictions(df, feats, start, end, model_factory, log=log)
     betting = build_betting_frame(preds)
     summary = build_summary(betting, vig, kelly_fraction)
+    odds_summary = build_odds_summary(betting, vig=vig, kelly_fraction=kelly_fraction)
+    odds_md = format_odds_summary_markdown(odds_summary, league=league)
 
     out = Path(out_dir) if out_dir else config.ml_results_dir(league)
     out.mkdir(parents=True, exist_ok=True)
     per_match_path = out / "clv_backtest.csv"
     summary_path = out / "clv_backtest_summary.csv"
+    odds_summary_path = out / "clv_odds_summary.csv"
+    odds_md_path = out / "clv_odds_summary.md"
+
     betting.to_csv(per_match_path, index=False)
     summary.to_csv(summary_path, index=False)
+    odds_summary.to_csv(odds_summary_path, index=False)
+    odds_md_path.write_text(odds_md, encoding="utf-8")
 
     log(f"[{league}] wrote {per_match_path}")
     log(f"[{league}] wrote {summary_path}")
+    log(f"[{league}] wrote {odds_summary_path}")
+    log(f"[{league}] wrote {odds_md_path}")
     log(f"[{league}] summary:")
     log(evaluate.table_to_string(summary))
+    log(f"[{league}] odds stratification summary:\n{odds_md}")
     return {
         "league": league,
         "per_match": betting,
         "summary": summary,
+        "odds_summary": odds_summary,
+        "odds_markdown": odds_md,
         "per_match_path": per_match_path,
         "summary_path": summary_path,
+        "odds_summary_path": odds_summary_path,
+        "odds_md_path": odds_md_path,
     }
 
 

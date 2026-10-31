@@ -175,7 +175,16 @@ def test_build_summary_segments_and_scopes():
     assert scopes == {"model", "baseline"}
     segments = set(summary["segment"])
     assert segments == {
-        "all", "has_closing", "bin_<0.50", "bin_0.50-0.70", "bin_>=0.70"
+        "all",
+        "has_closing",
+        "bin_<0.50",
+        "bin_0.50-0.70",
+        "bin_>=0.70",
+        "odds_1.00-1.50",
+        "odds_1.50-1.90",
+        "odds_1.90-2.50",
+        "odds_>2.50",
+        "odds_>1.90",
     }
     # Model rows carry CLV/loss columns; baseline rows do not.
     model_all = summary[
@@ -195,6 +204,105 @@ def test_build_summary_segments_and_scopes():
     ].iloc[0]
     assert model_hc["n"] == 3
     assert np.isfinite(model_hc["roi_flat_gross"])
+
+
+# ---------------------------------------------------------------------------
+# Odds Stratification
+# ---------------------------------------------------------------------------
+
+def test_assign_odds_bracket():
+    # Test scalars
+    assert backtest.assign_odds_bracket(1.25) == "1.00-1.50"
+    assert backtest.assign_odds_bracket(1.50) == "1.50-1.90"
+    assert backtest.assign_odds_bracket(1.85) == "1.50-1.90"
+    assert backtest.assign_odds_bracket(1.90) == "1.90-2.50"
+    assert backtest.assign_odds_bracket(2.50) == "1.90-2.50"
+    assert backtest.assign_odds_bracket(2.51) == ">2.50"
+    assert backtest.assign_odds_bracket(5.00) == ">2.50"
+    assert backtest.assign_odds_bracket(np.nan) is None
+    assert backtest.assign_odds_bracket(0.8) is None
+
+    # Test Series
+    s = pd.Series([1.10, 1.70, 2.10, 3.50, np.nan])
+    res = backtest.assign_odds_bracket(s)
+    assert res.iloc[0] == "1.00-1.50"
+    assert res.iloc[1] == "1.50-1.90"
+    assert res.iloc[2] == "1.90-2.50"
+    assert res.iloc[3] == ">2.50"
+    assert pd.isna(res.iloc[4])
+
+
+def test_build_betting_frame_odds_bracket():
+    df = backtest.build_betting_frame(_tiny_preds())
+    assert "odds_bracket" in df.columns
+    assert "odds_bin" in df.columns
+    # Match 0: 1.9 -> 1.90-2.50
+    # Match 1: NaN -> NaN
+    # Match 2: 3.1 -> >2.50
+    # Match 3: 1.8 -> 1.50-1.90
+    assert df["odds_bracket"].iloc[0] == "1.90-2.50"
+    assert pd.isna(df["odds_bracket"].iloc[1])
+    assert df["odds_bracket"].iloc[2] == ">2.50"
+    assert df["odds_bracket"].iloc[3] == "1.50-1.90"
+
+
+def test_build_odds_summary():
+    df = backtest.build_betting_frame(_tiny_preds())
+    summary = backtest.build_odds_summary(df, vig=0.03)
+    assert len(summary) == 6
+    brackets = list(summary["bracket"])
+    assert brackets == ["1.00-1.50", "1.50-1.90", "1.90-2.50", ">2.50", ">1.90", "All"]
+
+    # 1.00-1.50 has 0 matches
+    row_low = summary[summary["bracket"] == "1.00-1.50"].iloc[0]
+    assert row_low["n_bets"] == 0
+    assert np.isnan(row_low["model_accuracy"])
+    assert np.isnan(row_low["model_roi_gross"])
+
+    # 1.50-1.90 has 1 match (Match 3, loss)
+    row_mid = summary[summary["bracket"] == "1.50-1.90"].iloc[0]
+    assert row_mid["n_bets"] == 1
+    assert row_mid["model_accuracy"] == 0.0
+    assert row_mid["model_roi_gross"] == pytest.approx(-1.0)
+
+    # 1.90-2.50 has 1 match (Match 0, win @ 1.9)
+    row_high = summary[summary["bracket"] == "1.90-2.50"].iloc[0]
+    assert row_high["n_bets"] == 1
+    assert row_high["model_accuracy"] == 1.0
+    assert row_high["model_roi_gross"] == pytest.approx(0.9)
+
+    # >2.50 has 1 match (Match 2, win @ 3.1)
+    row_top = summary[summary["bracket"] == ">2.50"].iloc[0]
+    assert row_top["n_bets"] == 1
+    assert row_top["model_accuracy"] == 1.0
+    assert row_top["model_roi_gross"] == pytest.approx(2.1)
+
+    # >1.90 has 2 matches (Match 0 and Match 2, both wins)
+    row_hv = summary[summary["bracket"] == ">1.90"].iloc[0]
+    assert row_hv["n_bets"] == 2
+    assert row_hv["model_accuracy"] == 1.0
+    assert row_hv["model_roi_gross"] == pytest.approx((0.9 + 2.1) / 2)
+
+
+def test_format_odds_summary_markdown():
+    df = backtest.build_betting_frame(_tiny_preds())
+    summary = backtest.build_odds_summary(df, vig=0.03)
+    md = backtest.format_odds_summary_markdown(summary, league="serie_a")
+
+    assert "### Backtest Odds Stratification Summary (Serie A)" in md
+    assert "| Odds Bracket | Bets (N) | Model Acc | Baseline Acc | Model ROI (Gross) | Model ROI (Net) | Baseline ROI | Mean CLV |" in md
+    assert "| **> 1.90 (High-Value)** |" in md
+    assert "High-Value Bracket Highlights (> 1.90)" in md
+
+
+def test_export_odds_summary_markdown(tmp_path):
+    from src.export import export_odds_summary_markdown
+    df = backtest.build_betting_frame(_tiny_preds())
+    summary = backtest.build_odds_summary(df, vig=0.03)
+    out_file = tmp_path / "odds_report.md"
+    md = export_odds_summary_markdown(summary, out_path=out_file, league="serie_a")
+    assert out_file.exists()
+    assert out_file.read_text(encoding="utf-8") == md
 
 
 # ---------------------------------------------------------------------------
@@ -220,10 +328,16 @@ def test_run_backtest_end_to_end(tmp_path):
     # 3 validation seasons x 306 matches.
     assert len(per) == 3 * 306
     assert per["has_closing"].all()  # 2019-20 onward has closing odds
+    assert "odds_bracket" in per.columns
     assert out["per_match_path"].exists()
     assert out["summary_path"].exists()
+    assert out["odds_summary_path"].exists()
+    assert out["odds_md_path"].exists()
     summary = out["summary"]
-    assert len(summary) == 2 * 5  # 2 scopes x 5 segments
+    assert len(summary) == 2 * 10  # 2 scopes x 10 segments
+    odds_summary = out["odds_summary"]
+    assert len(odds_summary) == 6
+    assert "Odds Bracket" in out["odds_markdown"]
     model_all = summary[
         (summary["scope"] == "model") & (summary["segment"] == "all")
     ].iloc[0]
